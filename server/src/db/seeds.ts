@@ -9,6 +9,34 @@ function isOidcOnlyConfigured(): boolean {
 function seedAdminAccount(db: Database.Database): void {
   try {
     const userCount = (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+
+    const env_admin_email = process.env.ADMIN_EMAIL;
+    const env_admin_pw = process.env.ADMIN_PASSWORD;
+
+    // Recovery path: if there is exactly one admin who still has must_change_password=1
+    // (i.e. init setup was never completed) and ADMIN_EMAIL + ADMIN_PASSWORD env vars are
+    // now set, update the password so the operator can log in with the known credentials.
+    if (userCount === 1 && env_admin_email && env_admin_pw) {
+      const pendingAdmin = db.prepare(
+        "SELECT id, email FROM users WHERE role = 'admin' AND must_change_password = 1"
+      ).get() as { id: number; email: string } | undefined;
+
+      if (pendingAdmin && pendingAdmin.email === env_admin_email) {
+        const bcrypt = require('bcryptjs');
+        const hash = bcrypt.hashSync(env_admin_pw, 12);
+        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, pendingAdmin.id);
+        console.log('');
+        console.log('╔══════════════════════════════════════════════╗');
+        console.log('║  TREK — Init Admin Password Restored         ║');
+        console.log('╠══════════════════════════════════════════════╣');
+        console.log(`║  Email:    ${env_admin_email.padEnd(33)}║`);
+        console.log(`║  Password: ${env_admin_pw.padEnd(33)}║`);
+        console.log('╚══════════════════════════════════════════════╝');
+        console.log('');
+        return;
+      }
+    }
+
     if (userCount > 0) return;
 
     if (isOidcOnlyConfigured()) {
@@ -22,9 +50,6 @@ function seedAdminAccount(db: Database.Database): void {
     }
 
     const bcrypt = require('bcryptjs');
-
-    const env_admin_email = process.env.ADMIN_EMAIL;
-    const env_admin_pw = process.env.ADMIN_PASSWORD;
 
     let password;
     let email;
