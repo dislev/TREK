@@ -1,4 +1,5 @@
 import { reservationsApi } from '../../api/client'
+import { reservationRepo } from '../../repo/reservationRepo'
 import type { StoreApi } from 'zustand'
 import type { TripStoreState } from '../tripStore'
 import type { Reservation } from '../../types'
@@ -9,16 +10,17 @@ type GetState = StoreApi<TripStoreState>['getState']
 
 export interface ReservationsSlice {
   loadReservations: (tripId: number | string) => Promise<void>
-  addReservation: (tripId: number | string, data: Partial<Reservation>) => Promise<Reservation>
+  addReservation: (tripId: number | string, data: Partial<Reservation> & { title: string }) => Promise<Reservation>
   updateReservation: (tripId: number | string, id: number, data: Partial<Reservation>) => Promise<Reservation>
   toggleReservationStatus: (tripId: number | string, id: number) => Promise<void>
   deleteReservation: (tripId: number | string, id: number) => Promise<void>
+  setReservationTravelers: (tripId: number | string, id: number, userIds: number[]) => Promise<void>
 }
 
 export const createReservationsSlice = (set: SetState, get: GetState): ReservationsSlice => ({
   loadReservations: async (tripId) => {
     try {
-      const data = await reservationsApi.list(tripId)
+      const data = await reservationRepo.list(tripId)
       set({ reservations: data.reservations })
     } catch (err: unknown) {
       console.error('Failed to load reservations:', err)
@@ -57,8 +59,11 @@ export const createReservationsSlice = (set: SetState, get: GetState): Reservati
     }))
     try {
       await reservationsApi.update(tripId, id, { status: newStatus })
-    } catch {
+    } catch (err: unknown) {
+      // Roll back the optimistic toggle and surface the failure so the caller's
+      // catch can notify the user — without it the status silently snaps back.
       set({ reservations: prev })
+      throw new Error(getApiErrorMessage(err, 'Error updating reservation'))
     }
   },
 
@@ -68,6 +73,17 @@ export const createReservationsSlice = (set: SetState, get: GetState): Reservati
       set(state => ({ reservations: state.reservations.filter(r => r.id !== id) }))
     } catch (err: unknown) {
       throw new Error(getApiErrorMessage(err, 'Error deleting reservation'))
+    }
+  },
+
+  setReservationTravelers: async (tripId, id, userIds) => {
+    try {
+      const result = await reservationsApi.setTravelers(tripId, id, userIds)
+      set(state => ({
+        reservations: state.reservations.map(r => r.id === id ? { ...r, travelers: result.travelers } : r),
+      }))
+    } catch (err: unknown) {
+      throw new Error(getApiErrorMessage(err, 'Error updating travelers'))
     }
   },
 })

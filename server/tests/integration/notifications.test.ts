@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 
 const { testDb, dbMock } = vi.hoisted(() => {
   const Database = require('better-sqlite3');
@@ -38,31 +39,50 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
-vi.mock('../../src/websocket', () => ({ broadcastToUser: vi.fn() }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
+// The two test-send endpoints must not reach a real SMTP server or URL. Since
+// the fold they are provider methods, so they are stubbed on the prototype
+// rather than by module path — everything else in the domain stays real.
+vi.mock('../../src/nest/notifications/mailer/mailer.service', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/nest/notifications/mailer/mailer.service')>();
+  actual.MailerService.prototype.testSmtp = vi.fn().mockResolvedValue({ success: true });
+  return actual;
+});
+vi.mock('../../src/nest/notifications/transports/webhook.service', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/nest/notifications/transports/webhook.service')>();
+  actual.WebhookService.prototype.testWebhook = vi.fn().mockResolvedValue({ success: true });
+  return actual;
+});
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
 import { createUser, createAdmin, disableNotificationPref } from '../helpers/factories';
 import { authCookie } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
 });
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
   testDb.close();
 });
 
@@ -80,10 +100,13 @@ describe('Notification preferences', () => {
   it('NOTIF-001 — PUT /api/notifications/preferences updates settings', async () => {
     const { user } = createUser(testDb);
 
+    // The DTO ratchet enforces the matrix shape the client actually sends
+    // ({ event: { channel: enabled } }); the pre-matrix flat notify_* body
+    // this case used to send is rejected by the pipe now.
     const res = await request(app)
       .put('/api/notifications/preferences')
       .set('Cookie', authCookie(user.id))
-      .send({ notify_trip_invite: true, notify_booking_change: false });
+      .send({ trip_invite: { email: true }, booking_change: { email: false } });
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('preferences');
   });
@@ -160,17 +183,22 @@ describe('In-app notifications', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('GET /api/notifications/preferences — matrix format', () => {
-  it('NROUTE-002 — returns preferences, available_channels, event_types, implemented_combos', async () => {
+  it('NROUTE-002 — returns preferences, channels, event_types, implemented_combos', async () => {
     const { user } = createUser(testDb);
     const res = await request(app)
       .get('/api/notifications/preferences')
       .set('Cookie', authCookie(user.id));
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('preferences');
-    expect(res.body).toHaveProperty('available_channels');
+    expect(res.body).toHaveProperty('channels');
     expect(res.body).toHaveProperty('event_types');
     expect(res.body).toHaveProperty('implemented_combos');
-    expect(res.body.available_channels.inapp).toBe(true);
+    const inapp = res.body.channels.find((c: { id: string }) => c.id === 'inapp');
+    expect(inapp.active).toBe(true);
+    // The built-in external channels are always described, active or not.
+    expect(res.body.channels.map((c: { id: string }) => c.id)).toEqual(
+      expect.arrayContaining(['inapp', 'email', 'webhook', 'ntfy']),
+    );
   });
 
   it('NROUTE-003 — regular user does not see version_available in event_types', async () => {
@@ -290,9 +318,13 @@ describe('Notification test endpoints', () => {
   it('NOTIF-005 — POST /api/notifications/test-smtp requires admin', async () => {
     const { user } = createUser(testDb);
 
+    // Send the empty JSON body the client sends ({ email: undefined } →
+    // {}): a completely body-less POST has no content-type, so the DTO pipe
+    // rejects it before the admin gate since the ratchet.
     const res = await request(app)
       .post('/api/notifications/test-smtp')
-      .set('Cookie', authCookie(user.id));
+      .set('Cookie', authCookie(user.id))
+      .send({});
     // Non-admin gets 403
     expect(res.status).toBe(403);
   });
@@ -315,6 +347,67 @@ describe('Notification test endpoints', () => {
       .set('Cookie', authCookie(user.id))
       .send({ url: 'not-a-url' });
     expect(res.status).toBe(400);
+  });
+
+  it('NOTIF-005b — admin can call test-smtp and gets a result', async () => {
+    const { user } = createAdmin(testDb);
+
+    const res = await request(app)
+      .post('/api/notifications/test-smtp')
+      .set('Cookie', authCookie(user.id))
+      .send({ email: 'test@example.com' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('success');
+  });
+
+  it('NOTIF-006c — POST /api/notifications/test-webhook with valid URL calls testWebhook', async () => {
+    const { user } = createUser(testDb);
+
+    const res = await request(app)
+      .post('/api/notifications/test-webhook')
+      .set('Cookie', authCookie(user.id))
+      .send({ url: 'https://webhook.site/test-endpoint' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('success');
+  });
+
+  it('NOTIF-007 — POST /api/notifications/test-ntfy returns 400 when no topic configured', async () => {
+    const { user } = createUser(testDb);
+
+    const res = await request(app)
+      .post('/api/notifications/test-ntfy')
+      .set('Cookie', authCookie(user.id))
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+  });
+
+  it('NOTIF-008 — POST /api/notifications/test-ntfy with explicit topic returns 200', async () => {
+    const { user } = createUser(testDb);
+
+    const res = await request(app)
+      .post('/api/notifications/test-ntfy')
+      .set('Cookie', authCookie(user.id))
+      .send({ topic: 'trek-integration-test-topic' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('success');
+  });
+
+  it('NOTIF-009 — POST /api/notifications/test-ntfy falls back to user saved topic', async () => {
+    const { user } = createUser(testDb);
+    testDb.prepare("INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, 'ntfy_topic', 'saved-user-topic')").run(user.id);
+
+    const res = await request(app)
+      .post('/api/notifications/test-ntfy')
+      .set('Cookie', authCookie(user.id))
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('success');
   });
 });
 

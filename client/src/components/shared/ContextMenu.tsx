@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react'
-import ReactDOM from 'react-dom'
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { LucideIcon } from 'lucide-react'
 
 interface MenuItem {
@@ -14,15 +14,17 @@ interface MenuState {
   x: number
   y: number
   items: MenuItem[]
+  alignEnd?: boolean
 }
 
 export function useContextMenu() {
   const [menu, setMenu] = useState<MenuState | null>(null)
 
-  const open = (e: React.MouseEvent, items: MenuItem[]) => {
+  const open = (e: React.MouseEvent, items: MenuItem[], alignEnd = false) => {
     e.preventDefault()
     e.stopPropagation()
-    setMenu({ x: e.clientX, y: e.clientY, items })
+    const anchor = alignEnd ? e.currentTarget.getBoundingClientRect() : { right: e.clientX, bottom: e.clientY }
+    setMenu({ x: alignEnd ? anchor.right : e.clientX, y: alignEnd ? anchor.bottom + 6 : e.clientY, items, alignEnd })
   }
 
   const close = () => setMenu(null)
@@ -49,11 +51,12 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
     }
   }, [menu, onClose])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!menu || !ref.current) return
     const el = ref.current
     const rect = el.getBoundingClientRect()
     let { x, y } = menu
+    if (menu.alignEnd) x = Math.max(8, x - rect.width)
     if (x + rect.width > window.innerWidth - 8) x = window.innerWidth - rect.width - 8
     if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8
     if (x !== menu.x || y !== menu.y) {
@@ -64,26 +67,28 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
 
   if (!menu) return null
 
-  return ReactDOM.createPortal(
-    <div ref={ref} style={{
+  return createPortal(
+    <div ref={ref} className="trek-popover-enter" style={{
       position: 'fixed', left: menu.x, top: menu.y, zIndex: 999999,
       background: 'var(--bg-card)', borderRadius: 10, padding: '4px',
       border: '1px solid var(--border-primary)',
       boxShadow: '0 8px 30px rgba(0,0,0,0.15)',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
       minWidth: 160,
-      fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif",
-      animation: 'ctxIn 0.1s ease-out',
+      width: menu.alignEnd ? 'max-content' : undefined,
+      whiteSpace: menu.alignEnd ? 'nowrap' : undefined,
+      fontFamily: "var(--font-system)",
+      transformOrigin: menu.alignEnd ? 'top right' : 'top left',
     }}>
       {menu.items.filter(Boolean).map((item, i) => {
         if (item.divider) return <div key={i} style={{ height: 1, background: 'var(--border-faint)', margin: '3px 6px' }} />
         const Icon = item.icon
         return (
-          <button key={i} onClick={() => { item.onClick?.(); onClose() }} style={{
+          <button type="button" key={i} onClick={() => { item.onClick?.(); onClose() }} style={{
             display: 'flex', alignItems: 'center', gap: 8, width: '100%',
             padding: '7px 10px', borderRadius: 7, border: 'none',
             background: 'none', cursor: 'pointer', fontFamily: 'inherit',
-            fontSize: 12, fontWeight: 500, textAlign: 'left',
+            fontSize: 'calc(12px * var(--fs-scale-body, 1))', fontWeight: 500, textAlign: 'left',
             color: item.danger ? '#ef4444' : 'var(--text-primary)',
             transition: 'background 0.1s',
           }}
@@ -95,7 +100,6 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
           </button>
         )
       })}
-      <style>{`@keyframes ctxIn { from { opacity: 0; transform: scale(0.95) } to { opacity: 1; transform: scale(1) } }`}</style>
     </div>,
     document.body
   )

@@ -1,71 +1,115 @@
 name: Build & Push Docker Image
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
   workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Force bump line (auto = patch/finalize as today)'
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      confirm_major:
+        description: "Type MAJOR (all caps) to confirm a major release"
+        type: string
+        default: ''
 
 permissions:
   contents: write
 
+concurrency:
+  group: stable-build
+  cancel-in-progress: false
+
 jobs:
   version-bump:
+    if: github.repository == 'liketrek/TREK'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.VERSION }}
     steps:
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Determine bump type and update version
         id: bump
         run: |
-          # Check if this push is a merge commit from dev branch
-          COMMIT_MSG=$(git log -1 --pretty=%s)
-          PARENT_COUNT=$(git log -1 --pretty=%p | wc -w)
+          git fetch --tags
 
-          if echo "$COMMIT_MSG" | grep -qiE "^Merge (pull request|branch).*dev"; then
+          # Derive version from git tags — no package.json dependency
+          STABLE_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -v '\-pre\.' | sort -V | tail -1)
+          STABLE="${STABLE_TAG#v}"
+          STABLE="${STABLE:-0.0.0}"
+
+          PRE_TAG=$(git tag -l 'v*-pre.*' | sort -V | tail -1)
+
+          BUMP_INPUT="${{ github.event.inputs.bump || 'auto' }}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$STABLE"
+
+          if [ "$BUMP_INPUT" = "major" ]; then
+            if [ "${{ github.event.inputs.confirm_major }}" != "MAJOR" ]; then
+              echo "::error::confirm_major must equal 'MAJOR' to cut a major release"
+              exit 1
+            fi
+            NEW_VERSION="$((MAJOR + 1)).0.0"
+            BUMP="major"
+          elif [ "$BUMP_INPUT" = "minor" ]; then
+            NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
             BUMP="minor"
-          elif [ "$PARENT_COUNT" -gt 1 ] && git log -1 --pretty=%P | xargs -n1 git branch -r --contains 2>/dev/null | grep -q "origin/dev"; then
-            BUMP="minor"
-          else
+          elif [ "$BUMP_INPUT" = "patch" ]; then
+            NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
             BUMP="patch"
+          else
+            # auto: finalize in-flight prerelease if one exists, else patch
+            if [ -n "$PRE_TAG" ]; then
+              PRE_BASE="${PRE_TAG#v}"
+              PRE_BASE="${PRE_BASE%-pre.*}"
+              PRE_MAJOR="$(echo "$PRE_BASE" | cut -d. -f1)"
+              # Refuse to auto-finalize a major bump — it bypasses confirm_major
+              if [ "$PRE_MAJOR" -gt "$MAJOR" ]; then
+                echo "::error::In-flight prerelease $PRE_TAG is a major bump ($STABLE → $PRE_BASE). Use bump=major with confirm_major=MAJOR to finalize."
+                exit 1
+              fi
+              # If prerelease base is strictly greater than stable, finalize it
+              HIGHEST=$(printf '%s\n' "$PRE_BASE" "$STABLE" | sort -V | tail -1)
+              if [ "$HIGHEST" = "$PRE_BASE" ] && [ "$PRE_BASE" != "$STABLE" ]; then
+                NEW_VERSION="$PRE_BASE"
+                BUMP="finalize"
+              else
+                PATCH=$((PATCH + 1))
+                NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+                BUMP="patch"
+              fi
+            else
+              PATCH=$((PATCH + 1))
+              NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+              BUMP="patch"
+            fi
           fi
 
           echo "Bump type: $BUMP"
-
-          # Read current version
-          CURRENT=$(node -p "require('./server/package.json').version")
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-
-          if [ "$BUMP" = "minor" ]; then
-            MINOR=$((MINOR + 1))
-            PATCH=0
-          else
-            PATCH=$((PATCH + 1))
-          fi
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "$CURRENT → $NEW_VERSION ($BUMP)"
+          echo "$STABLE → $NEW_VERSION ($BUMP)"
 
-          # Update package.json files and Helm chart
-          cd server && npm version "$NEW_VERSION" --no-git-tag-version && cd ..
-          cd client && npm version "$NEW_VERSION" --no-git-tag-version && cd ..
+          # Update all workspace + root package.json files and the root lockfile in one shot
+          npm version "$NEW_VERSION" --workspaces --include-workspace-root --no-git-tag-version
           sed -i "s/^version: .*/version: $NEW_VERSION/" charts/trek/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"$NEW_VERSION\"/" charts/trek/Chart.yaml
 
           # Commit and tag
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add server/package.json server/package-lock.json client/package.json client/package-lock.json charts/trek/Chart.yaml
+          git add package.json package-lock.json server/package.json client/package.json shared/package.json charts/trek/Chart.yaml
           git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
-          git tag "v$NEW_VERSION"
+          git tag -a "v$NEW_VERSION" -m "v$NEW_VERSION"
           git push origin main --follow-tags
 
   build:
@@ -102,6 +146,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=mauriceboe/trek,push-by-digest=true,name-canonical=true,push=true
           no-cache: true
+          build-args: |
+            APP_VERSION=${{ needs.version-bump.outputs.version }}
 
       - name: Export digest
         run: |
@@ -130,7 +176,8 @@ jobs:
         with:
           path: /tmp/digests
           pattern: digests-*
-          merge-multiple: true
+          # Deliberately NOT merged: the per-platform folder names are what lets
+          # the manifest below be assembled in a fixed order.
 
       - uses: docker/setup-buildx-action@v3
 
@@ -142,13 +189,28 @@ jobs:
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
         run: |
-          VERSION=${{ needs.version-bump.outputs.version }}
-          mapfile -t digests < <(printf 'mauriceboe/trek@sha256:%s\n' *)
+          set -euo pipefail
+          VERSION="${{ needs.version-bump.outputs.version }}"
+          MAJOR_TAG="$(echo "$VERSION" | cut -d. -f1)"
+          # amd64 first, always. This used to be a glob over hash-named files, so
+          # the order changed from one release to the next: 3.4.1 listed amd64
+          # first and 4.0.0 listed arm64 first. Clients that read the first entry
+          # of the index rather than matching their own platform then compare the
+          # wrong digest and report "no update" — which is what Unraid users hit
+          # on :latest after 4.0.0 shipped. The image was fine; the order was not.
+          digests=()
+          for platform in linux-amd64 linux-arm64; do
+            dir="digests-$platform"
+            [ -d "$dir" ] || { echo "::error::missing digest artifact for $platform"; exit 1; }
+            for f in "$dir"/*; do
+              [ -e "$f" ] || { echo "::error::no digest file in $dir"; exit 1; }
+              digests+=("mauriceboe/trek@sha256:$(basename "$f")")
+            done
+          done
           docker buildx imagetools create \
-            -t mauriceboe/trek:latest \
-            -t mauriceboe/trek:$VERSION \
-            -t mauriceboe/nomad:latest \
-            -t mauriceboe/nomad:$VERSION \
+            -t "mauriceboe/trek:latest" \
+            -t "mauriceboe/trek:$MAJOR_TAG" \
+            -t "mauriceboe/trek:$VERSION" \
             "${digests[@]}"
 
       - name: Inspect manifest
@@ -168,3 +230,4 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           charts_dir: charts
+          charts_url: https://chart.liketrek.com

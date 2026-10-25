@@ -1,10 +1,11 @@
 /**
  * Days & Accommodations API integration tests.
- * Covers DAY-001 through DAY-006 and ACCOM-001 through ACCOM-003.
+ * Covers DAY-001 through DAY-013 and ACCOM-001 through ACCOM-006.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory DB — schema applied in beforeAll after mocks register
@@ -38,20 +39,33 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
 import { createUser, createTrip, createDay, createPlace, addTripMember } from '../helpers/factories';
 import { authCookie } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
-beforeAll(() => { createTables(testDb); runMigrations(testDb); });
-beforeEach(() => { resetTestDb(testDb); loginAttempts.clear(); mfaAttempts.clear(); });
-afterAll(() => { testDb.close(); });
+let nestApp: INestApplication;
+let app: Application;
+beforeAll(async () => {
+  createTables(testDb);
+  runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
+});
+beforeEach(() => { resetTestDb(testDb); resetRateLimits(nestApp); });
+afterAll(async () => {
+  await nestApp.close();
+  testDb.close();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List days (DAY-001, DAY-002)
@@ -108,7 +122,7 @@ describe('List days', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Create day (DAY-006)
+// Create day (DAY-006, DAY-011 to DAY-013)
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('Create day', () => {
@@ -152,6 +166,61 @@ describe('Create day', () => {
       .send({ notes: 'Infiltration' });
 
     expect(res.status).toBe(404);
+  });
+
+  it('DAY-011: a dated create adds the next date behind the dated days, and the trip ends on it', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip', start_date: '2026-08-01', end_date: '2026-08-02' });
+    const spare = createDay(testDb, trip.id);
+
+    const res = await request(app)
+      .post(`/api/trips/${trip.id}/days`)
+      .set('Cookie', authCookie(user.id))
+      .send({ dated: true });
+
+    expect(res.status).toBe(201);
+    expect(res.body.day).toMatchObject({ trip_id: trip.id, day_number: 3, date: '2026-08-03' });
+    expect(res.body.trip).toMatchObject({ id: trip.id, end_date: '2026-08-03', day_count: 4 });
+    expect(res.body.trip).not.toHaveProperty('feed_token', expect.anything());
+    const reread = await request(app).get(`/api/trips/${trip.id}`).set('Cookie', authCookie(user.id));
+    expect(reread.body.trip).toMatchObject({ start_date: '2026-08-01', end_date: '2026-08-03' });
+    const list = await request(app).get(`/api/trips/${trip.id}/days`).set('Cookie', authCookie(user.id));
+    expect(list.body.days.map((d: { id: number; date: string | null }) => [d.id, d.date])).toEqual([
+      [expect.any(Number), '2026-08-01'],
+      [expect.any(Number), '2026-08-02'],
+      [res.body.day.id, '2026-08-03'],
+      [spare.id, null],
+    ]);
+  });
+
+  it('DAY-012: a dated create on a trip without dates is refused with 400 and adds nothing', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Open Trip' });
+    createDay(testDb, trip.id);
+
+    const res = await request(app)
+      .post(`/api/trips/${trip.id}/days`)
+      .set('Cookie', authCookie(user.id))
+      .send({ dated: true });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'This trip has no dates. Add a day without a date instead.' });
+    expect(testDb.prepare('SELECT COUNT(*) AS n FROM days WHERE trip_id = ?').get(trip.id)).toEqual({ n: 1 });
+  });
+
+  it('DAY-013: dated next to a position is refused by the contract with 400 and adds nothing', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip', start_date: '2026-08-01', end_date: '2026-08-02' });
+
+    const res = await request(app)
+      .post(`/api/trips/${trip.id}/days`)
+      .set('Cookie', authCookie(user.id))
+      .send({ dated: true, position: 1 });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain('dated cannot be combined with date or position');
+    expect(testDb.prepare('SELECT COUNT(*) AS n FROM days WHERE trip_id = ?').get(trip.id)).toEqual({ n: 2 });
+    expect(testDb.prepare('SELECT end_date FROM trips WHERE id = ?').get(trip.id)).toEqual({ end_date: '2026-08-02' });
   });
 });
 
@@ -253,6 +322,7 @@ describe('Delete day', () => {
     const { user } = createUser(testDb);
     const trip = createTrip(testDb, user.id, { title: 'Trip' });
     const day = createDay(testDb, trip.id);
+    createDay(testDb, trip.id);
 
     const res = await request(app)
       .delete(`/api/trips/${trip.id}/days/${day.id}`)
@@ -275,6 +345,74 @@ describe('Delete day', () => {
 
     expect(res.status).toBe(404);
     expect(res.body.error).toMatch(/not found/i);
+  });
+
+  it('DAY-007: the days after a deleted one close up, and the answer carries the trip with its new day count', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip' });
+    const [a, b, c] = [createDay(testDb, trip.id), createDay(testDb, trip.id), createDay(testDb, trip.id)];
+
+    const res = await request(app)
+      .delete(`/api/trips/${trip.id}/days/${b.id}`)
+      .set('Cookie', authCookie(user.id));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ success: true, trip: { id: trip.id, day_count: 2 } });
+    const list = await request(app).get(`/api/trips/${trip.id}/days`).set('Cookie', authCookie(user.id));
+    expect(list.body.days.map((d: { id: number; day_number: number }) => [d.id, d.day_number])).toEqual([[a.id, 1], [c.id, 2]]);
+  });
+
+  it('DAY-008: deleting a dated day with no day left to take the last date ends the trip a day earlier', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip', start_date: '2026-08-01', end_date: '2026-08-03' });
+    const first = testDb.prepare('SELECT id FROM days WHERE trip_id = ? ORDER BY day_number LIMIT 1').get(trip.id) as { id: number };
+
+    const res = await request(app)
+      .delete(`/api/trips/${trip.id}/days/${first.id}`)
+      .set('Cookie', authCookie(user.id));
+
+    expect(res.status).toBe(200);
+    expect(res.body.trip).toMatchObject({ start_date: '2026-08-01', end_date: '2026-08-02' });
+    const reread = await request(app).get(`/api/trips/${trip.id}`).set('Cookie', authCookie(user.id));
+    expect(reread.body.trip).toMatchObject({ start_date: '2026-08-01', end_date: '2026-08-02' });
+    const list = await request(app).get(`/api/trips/${trip.id}/days`).set('Cookie', authCookie(user.id));
+    expect(list.body.days.map((d: { date: string }) => d.date)).toEqual(['2026-08-01', '2026-08-02']);
+  });
+
+  it('DAY-009: the last day of a trip is refused with 400 and stays', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip' });
+    const day = createDay(testDb, trip.id);
+
+    const res = await request(app)
+      .delete(`/api/trips/${trip.id}/days/${day.id}`)
+      .set('Cookie', authCookie(user.id));
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'A trip needs at least one day.' });
+    expect(testDb.prepare('SELECT id FROM days WHERE id = ?').get(day.id)).toBeDefined();
+  });
+
+  it('DAY-010: a member without day_edit gets 403 and the day stays', async () => {
+    const { user: owner } = createUser(testDb);
+    const { user: member } = createUser(testDb);
+    const trip = createTrip(testDb, owner.id, { title: 'Trip' });
+    addTripMember(testDb, trip.id, member.id);
+    const day = createDay(testDb, trip.id);
+    createDay(testDb, trip.id);
+    testDb.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('perm_day_edit', 'trip_owner')").run();
+    const { invalidatePermissionsCache } = await import('../../src/nest/permissions/permissions-cache');
+    invalidatePermissionsCache();
+    try {
+      const res = await request(app)
+        .delete(`/api/trips/${trip.id}/days/${day.id}`)
+        .set('Cookie', authCookie(member.id));
+      expect(res.status).toBe(403);
+      expect(testDb.prepare('SELECT id FROM days WHERE id = ?').get(day.id)).toBeDefined();
+    } finally {
+      testDb.prepare("DELETE FROM app_settings WHERE key = 'perm_day_edit'").run();
+      invalidatePermissionsCache();
+    }
   });
 });
 
@@ -434,6 +572,46 @@ describe('Accommodations', () => {
     expect(reservation.confirmation_number).toBe('CONF-XYZ');
   });
 
+  it('ACCOM-004 — PUT /api/trips/:tripId/accommodations/:id updates the accommodation', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Hotel Trip' });
+    const day1 = createDay(testDb, trip.id, { date: '2026-10-20' });
+    const day2 = createDay(testDb, trip.id, { date: '2026-10-22' });
+    const day3 = createDay(testDb, trip.id, { date: '2026-10-25' });
+    const place = createPlace(testDb, trip.id, { name: 'City Inn' });
+
+    const createRes = await request(app)
+      .post(`/api/trips/${trip.id}/accommodations`)
+      .set('Cookie', authCookie(user.id))
+      .send({ place_id: place.id, start_day_id: day1.id, end_day_id: day2.id, notes: 'Original' });
+
+    expect(createRes.status).toBe(201);
+    const accommodationId = createRes.body.accommodation.id;
+
+    const updateRes = await request(app)
+      .put(`/api/trips/${trip.id}/accommodations/${accommodationId}`)
+      .set('Cookie', authCookie(user.id))
+      .send({ place_id: place.id, start_day_id: day1.id, end_day_id: day3.id, notes: 'Extended stay' });
+
+    expect(updateRes.status).toBe(200);
+    expect(updateRes.body.accommodation).toBeDefined();
+    expect(updateRes.body.accommodation.end_day_id).toBe(day3.id);
+    expect(updateRes.body.accommodation.notes).toBe('Extended stay');
+  });
+
+  it('ACCOM-004 — PUT non-existent accommodation returns 404', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Trip' });
+
+    const res = await request(app)
+      .put(`/api/trips/${trip.id}/accommodations/999999`)
+      .set('Cookie', authCookie(user.id))
+      .send({ notes: 'Ghost update' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+
   it('ACCOM-003 — Deleting accommodation also removes the linked reservation', async () => {
     const { user } = createUser(testDb);
     const trip = createTrip(testDb, user.id, { title: 'Hotel Trip' });
@@ -461,5 +639,47 @@ describe('Accommodations', () => {
       'SELECT id FROM reservations WHERE id = ?'
     ).get(reservationBefore.id);
     expect(reservationAfter).toBeUndefined();
+  });
+
+  it('ACCOM-006 — DELETE accommodation also removes its linked budget item (issue #933)', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Hotel Budget Trip' });
+    const day1 = createDay(testDb, trip.id, { date: '2026-11-01' });
+    const day2 = createDay(testDb, trip.id, { date: '2026-11-03' });
+    const place = createPlace(testDb, trip.id, { name: 'Grand Hotel' });
+
+    // Create a hotel reservation that creates an accommodation and a linked budget item
+    const createRes = await request(app)
+      .post(`/api/trips/${trip.id}/reservations`)
+      .set('Cookie', authCookie(user.id))
+      .send({
+        title: 'Grand Hotel Stay',
+        type: 'hotel',
+        day_id: day1.id,
+        create_accommodation: { place_id: place.id, start_day_id: day1.id, end_day_id: day2.id },
+        create_budget_entry: { total_price: 450, category: 'Accommodation' },
+      });
+    expect(createRes.status).toBe(201);
+
+    const accommodationId = testDb.prepare(
+      'SELECT id FROM day_accommodations WHERE trip_id = ?'
+    ).get(trip.id) as any;
+    expect(accommodationId).toBeDefined();
+
+    const budgetBefore = testDb.prepare(
+      'SELECT id FROM budget_items WHERE trip_id = ?'
+    ).get(trip.id);
+    expect(budgetBefore).toBeDefined();
+
+    // Delete via the accommodation endpoint (the primary bug path)
+    const delRes = await request(app)
+      .delete(`/api/trips/${trip.id}/accommodations/${accommodationId.id}`)
+      .set('Cookie', authCookie(user.id));
+    expect(delRes.status).toBe(200);
+
+    const budgetAfter = testDb.prepare(
+      'SELECT id FROM budget_items WHERE trip_id = ?'
+    ).get(trip.id);
+    expect(budgetAfter).toBeUndefined();
   });
 });

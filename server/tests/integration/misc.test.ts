@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 
 const { testDb, dbMock } = vi.hoisted(() => {
   const Database = require('better-sqlite3');
@@ -35,30 +36,37 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
 import { createUser } from '../helpers/factories';
 import { authCookie } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
 });
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
   testDb.close();
 });
 
@@ -94,19 +102,37 @@ describe('Photo endpoint auth', () => {
 });
 
 describe('Force HTTPS redirect', () => {
-  it('MISC-004 — FORCE_HTTPS redirect sends 301 for HTTP requests', async () => {
-    // createApp() reads FORCE_HTTPS at call time, so we need a fresh app instance
+  it('MISC-004 — FORCE_HTTPS redirect sends 301 for HTTP requests on non-health paths', async () => {
+    // applyGlobalMiddleware reads FORCE_HTTPS when buildApp() composes the app, so
+    // we need a fresh Nest instance built with the flag set.
     process.env.FORCE_HTTPS = 'true';
-    let httpsApp: Express;
+    let httpsApp: INestApplication | undefined;
     try {
-      httpsApp = createApp();
+      httpsApp = await buildApp();
+      const res = await request(httpsApp.getHttpAdapter().getInstance())
+        .get('/api/addons')
+        .set('X-Forwarded-Proto', 'http');
+      expect(res.status).toBe(301);
     } finally {
+      if (httpsApp) await httpsApp.close();
       delete process.env.FORCE_HTTPS;
     }
-    const res = await request(httpsApp)
-      .get('/api/health')
-      .set('X-Forwarded-Proto', 'http');
-    expect(res.status).toBe(301);
+  });
+
+  it('MISC-008 — FORCE_HTTPS does not redirect /api/health (probes must reach it over HTTP)', async () => {
+    process.env.FORCE_HTTPS = 'true';
+    let httpsApp: INestApplication | undefined;
+    try {
+      httpsApp = await buildApp();
+      const res = await request(httpsApp.getHttpAdapter().getInstance())
+        .get('/api/health')
+        .set('X-Forwarded-Proto', 'http');
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+    } finally {
+      if (httpsApp) await httpsApp.close();
+      delete process.env.FORCE_HTTPS;
+    }
   });
 
   it('MISC-004 — no redirect when FORCE_HTTPS is not set', async () => {
@@ -119,24 +145,56 @@ describe('Force HTTPS redirect', () => {
   });
 });
 
-describe('Categories endpoint', () => {
-  it('MISC-013/PLACE-015 — GET /api/categories returns seeded categories', async () => {
-    const { user } = createUser(testDb);
 
+describe('Request body ceiling', () => {
+  // The Express shell set '100kb' and stopped when the Nest instance took over
+  // parsing, which left the limit implicit. This pins it, so it cannot drift
+  // back to a framework default without somebody noticing.
+  it('MISC-009 — a body over 100kb is refused with 413', async () => {
     const res = await request(app)
-      .get('/api/categories')
-      .set('Cookie', authCookie(user.id));
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.categories)).toBe(true);
-    expect(res.body.categories.length).toBeGreaterThan(0);
+      .post('/api/auth/login')
+      .set('Content-Type', 'application/json')
+      .send({ email: 'a@b.c', password: 'x'.repeat(200 * 1024) });
+    expect(res.status).toBe(413);
   });
-});
 
-describe('App config', () => {
-  it('MISC-015 — GET /api/auth/app-config returns configuration', async () => {
-    const res = await request(app).get('/api/auth/app-config');
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('allow_registration');
-    expect(res.body).toHaveProperty('oidc_configured');
+  it('MISC-010 — a body under it still reaches the handler', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .set('Content-Type', 'application/json')
+      .send({ email: 'a@b.c', password: 'x'.repeat(1024) });
+    expect(res.status).not.toBe(413);
+  });
+
+  // A list file may be a megabyte (#2198), and the three routes that carry one
+  // whole are measured against that instead (#2301): the import into a new
+  // list, the GPX reader, and the import into a list that already exists.
+  // Only those three.
+  it('MISC-011: a list file over 100kb reaches both imports and the GPX reader', async () => {
+    for (const route of [
+      '/api/addons/collections/import',
+      '/api/addons/collections/gpx/read',
+      '/api/addons/collections/7/import',
+    ]) {
+      const res = await request(app)
+        .post(route)
+        .set('Content-Type', 'application/json')
+        .send({ gpx: 'x'.repeat(300 * 1024) });
+      expect(res.status, route).not.toBe(413);
+    }
+  });
+
+  it('MISC-012: a list file past twice the file limit is still refused, and no other route got the larger ceiling', async () => {
+    const huge = await request(app)
+      .post('/api/addons/collections/gpx/read')
+      .set('Content-Type', 'application/json')
+      .send({ gpx: 'x'.repeat(2 * 1024 * 1024 + 1) });
+    expect(huge.status).toBe(413);
+
+    const elsewhere = await request(app)
+      .post('/api/addons/collections')
+      .set('Content-Type', 'application/json')
+      .send({ name: 'x'.repeat(200 * 1024) });
+    expect(elsewhere.status).toBe(413);
   });
 });

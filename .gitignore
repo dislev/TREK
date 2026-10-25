@@ -3,6 +3,10 @@ node_modules/
 
 # Build output
 client/dist/
+server/dist/
+shared/dist/
+server/public/*
+!server/public/.gitkeep
 
 # Generated PWA icons (built from SVG via prebuild)
 client/public/icons/*.png
@@ -16,7 +20,7 @@ client/public/icons/*.png
 *.sqlite-wal
 
 # User data
-server/data/
+server/data/*
 server/uploads/
 
 # Environment
@@ -47,6 +51,7 @@ yarn-error.log*
 
 # Coverage
 coverage
+coverage-*/
 *.lcov
 .nyc_output
 
@@ -59,3 +64,9 @@ coverage
 
 .scannerwork
 test-data
+
+# Live-MinIO/AIStor manual test license key — never commit, operators obtain their own free key
+minio-licence.key
+
+.run
+.full-review

@@ -1,38 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readEnv } from './app-config';
 
 const dataDir = path.resolve(__dirname, '../data');
-
-// JWT_SECRET is always managed by the server — auto-generated on first start and
-// persisted to data/.jwt_secret. Use the admin panel to rotate it; do not set it
-// via environment variable (env var would override a rotation on next restart).
 const jwtSecretFile = path.join(dataDir, '.jwt_secret');
-let _jwtSecret: string;
-
-try {
-  _jwtSecret = fs.readFileSync(jwtSecretFile, 'utf8').trim();
-} catch {
-  _jwtSecret = crypto.randomBytes(32).toString('hex');
-  try {
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(jwtSecretFile, _jwtSecret, { mode: 0o600 });
-    console.log('Generated and saved JWT secret to', jwtSecretFile);
-  } catch (writeErr: unknown) {
-    console.warn('WARNING: Could not persist JWT secret to disk:', writeErr instanceof Error ? writeErr.message : writeErr);
-    console.warn('Sessions will reset on server restart.');
-  }
-}
-
-// export let so TypeScript's CJS output keeps exports.JWT_SECRET live
-// (generates `exports.JWT_SECRET = JWT_SECRET = newVal` inside updateJwtSecret)
-export let JWT_SECRET = _jwtSecret;
-
-// Called by the admin rotate-jwt-secret endpoint to update the in-process
-// binding that all middleware and route files reference.
-export function updateJwtSecret(newSecret: string): void {
-  JWT_SECRET = newSecret;
-}
 
 // ENCRYPTION_KEY is used to derive at-rest encryption keys for stored secrets
 // (API keys, MFA TOTP secrets, SMTP password, OIDC client secret, etc.).
@@ -64,8 +36,34 @@ if (_encryptionKey) {
   // Try the dedicated key file first (covers all installs after first start).
   try {
     _encryptionKey = fs.readFileSync(encKeyFile, 'utf8').trim();
-  } catch {
+  } catch (readErr: unknown) {
+    const code = (readErr as NodeJS.ErrnoException)?.code;
+    if (code !== 'ENOENT') {
+      // The file is there, we just cannot read it (permissions, I/O error).
+      // Continuing would resolve a different key and overwrite this one below,
+      // which permanently orphans every stored secret. Refuse to start instead.
+      // The errno goes in the line because this exit crash-loops the container,
+      // and the code is the only part that says which of these it is.
+      console.error(
+        `FATAL: could not read ${encKeyFile} (${code ?? 'no errno'}) -`,
+        readErr instanceof Error ? readErr.message : readErr,
+      );
+      if (code === 'EISDIR') {
+        // Compose creating a missing bind-mount source as a directory is by far
+        // the most common way this file stops being a file.
+        console.error('EISDIR: the path is a directory. A bind mount pointed at data/.encryption_key created it as one — remove it and mount the data directory instead.');
+      }
+      console.error('Fix the file permissions or set ENCRYPTION_KEY explicitly.');
+      process.exit(1);
+    }
     // File not found — first start on an existing or fresh install.
+  }
+
+  if (!_encryptionKey && fs.existsSync(encKeyFile)) {
+    // Present but empty: a truncated write, a full disk, a broken restore.
+    // Same reasoning as above. Regenerating here would silently replace the real key.
+    console.error('FATAL:', encKeyFile, 'is empty. Restore it from backup or set ENCRYPTION_KEY.');
+    process.exit(1);
   }
 
   if (!_encryptionKey) {
@@ -92,9 +90,66 @@ if (_encryptionKey) {
     fs.writeFileSync(encKeyFile, _encryptionKey, { mode: 0o600 });
     console.log('Encryption key persisted to', encKeyFile);
   } catch (writeErr: unknown) {
-    console.warn('WARNING: Could not persist encryption key to disk:', writeErr instanceof Error ? writeErr.message : writeErr);
+    console.warn(
+      'WARNING: Could not persist encryption key to disk:',
+      writeErr instanceof Error ? writeErr.message : writeErr,
+    );
     console.warn('Set ENCRYPTION_KEY env var to avoid losing access to encrypted secrets on restart.');
   }
 }
 
 export const ENCRYPTION_KEY = _encryptionKey;
+
+// JWT_SECRET is always managed by the server — auto-generated on first start and
+// persisted to data/.jwt_secret. Use the admin panel to rotate it; do not set it
+// via environment variable (env var would override a rotation on next restart).
+let _jwtSecret: string;
+
+try {
+  _jwtSecret = fs.readFileSync(jwtSecretFile, 'utf8').trim();
+} catch {
+  _jwtSecret = crypto.randomBytes(32).toString('hex');
+  try {
+    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(jwtSecretFile, _jwtSecret, { mode: 0o600 });
+    console.log('Generated and saved JWT secret to', jwtSecretFile);
+  } catch (writeErr: unknown) {
+    console.warn(
+      'WARNING: Could not persist JWT secret to disk:',
+      writeErr instanceof Error ? writeErr.message : writeErr,
+    );
+    console.warn('Sessions will reset on server restart.');
+  }
+}
+
+// export let so TypeScript's CJS output keeps exports.JWT_SECRET live
+// (generates `exports.JWT_SECRET = JWT_SECRET = newVal` inside updateJwtSecret)
+export let JWT_SECRET = _jwtSecret;
+
+// Called by the admin rotate-jwt-secret endpoint to update the in-process
+// binding that all middleware and route files reference.
+export function updateJwtSecret(newSecret: string): void {
+  JWT_SECRET = newSecret;
+}
+
+// DEFAULT_LANGUAGE / SESSION_DURATION* parsing moved into src/app-config
+// (env.schema.ts validates fail-fast at boot; derive.ts resolves/falls back).
+// Re-exported here — frozen at import, exactly like before — so the many
+// importers of this module (mcp, middleware, services, e2e harness) are
+// untouched. This module now owns only key material (above).
+const sessionEnv = readEnv().session;
+
+/** Default login-page language, validated against the supported set ('en' fallback). */
+export const DEFAULT_LANGUAGE = readEnv().app.defaultLanguage;
+/** Human-readable session length actually in effect (for logs/diagnostics). */
+export const SESSION_DURATION = sessionEnv.duration;
+/** Session length in milliseconds — used for the cookie `maxAge`. */
+export const SESSION_DURATION_MS = sessionEnv.durationMs;
+/** Session length in seconds — passed to `jwt.sign({ expiresIn })` (number = seconds). */
+export const SESSION_DURATION_SECONDS = sessionEnv.durationSeconds;
+/** Human-readable "remember me" session length actually in effect (for logs/diagnostics). */
+export const SESSION_DURATION_REMEMBER = sessionEnv.durationRemember;
+/** "Remember me" session length in milliseconds — used for the persistent cookie `maxAge`. */
+export const SESSION_DURATION_REMEMBER_MS = sessionEnv.durationRememberMs;
+/** "Remember me" session length in seconds — passed to `jwt.sign({ expiresIn })`. */
+export const SESSION_DURATION_REMEMBER_SECONDS = sessionEnv.durationRememberSeconds;

@@ -10,6 +10,9 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
+import path from 'path';
+import fs from 'fs';
 
 const { testDb, dbMock } = vi.hoisted(() => {
   const Database = require('better-sqlite3');
@@ -40,35 +43,48 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
-import { createUser } from '../helpers/factories';
-import { authCookie, generateToken } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
+import { createUser, createTrip } from '../helpers/factories';
+import { authCookie, authHeader, generateToken } from '../helpers/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
+const FIXTURE_IMG = path.join(__dirname, '../fixtures/small-image.jpg');
+const uploadsDir = path.join(__dirname, '../../uploads/files');
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+  testDb.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('allowed_file_types', '*')").run();
 });
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
+  testDb.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('allowed_file_types', '*')").run();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
+  fs.rmSync(uploadsDir, { recursive: true, force: true });
   testDb.close();
 });
 
 describe('Authentication security', () => {
-  it('SEC-007 — JWT in Authorization Bearer header authenticates user', async () => {
+  it('SEC-007 — invalid JWT in Authorization Bearer header is rejected', async () => {
     const { user } = createUser(testDb);
     const token = generateToken(user.id);
 
@@ -120,6 +136,35 @@ describe('API key encryption', () => {
     expect(row.openweather_api_key).toMatch(/^enc:v1:/);
   });
 
+  it('SEC-008 — saving keys audits the names and never the values (#1939)', async () => {
+    const { user } = createUser(testDb);
+
+    const save = () =>
+      request(app)
+        .put('/api/auth/me/api-keys')
+        .set('Cookie', authCookie(user.id))
+        .send({ openweather_api_key: 'test-api-key-12345' });
+
+    const first = await save();
+    expect(first.status).toBe(200);
+    // changedKeys is internal: the client body is what it always was.
+    expect(first.body).not.toHaveProperty('changedKeys');
+
+    const rows = () =>
+      testDb
+        .prepare("SELECT details FROM audit_log WHERE action = 'settings.api_keys_update'")
+        .all() as { details: string | null }[];
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0].details).toContain('openweather_api_key');
+    expect(rows()[0].details).not.toContain('test-api-key-12345');
+
+    // The same value again writes no second row. This is the real test of the
+    // cleartext comparison: encryption uses a random IV, so the stored blob
+    // differs on every save even when the key does not.
+    await save();
+    expect(rows()).toHaveLength(1);
+  });
+
   it('SEC-008 — GET /api/auth/me does not return plaintext API key', async () => {
     const { user } = createUser(testDb);
     await request(app)
@@ -162,12 +207,24 @@ describe('Request body size limit', () => {
 describe('File download path traversal', () => {
   it('SEC-005 — path traversal in file download is blocked', async () => {
     const { user } = createUser(testDb);
-    const trip = { id: 1 };
+    const trip = createTrip(testDb, user.id);
+
+    const upload = await request(app)
+      .post(`/api/trips/${trip.id}/files`)
+      .set('Cookie', authCookie(user.id))
+      .attach('file', FIXTURE_IMG);
+    expect(upload.status).toBe(201);
+    const fileId = upload.body.file.id;
+
+    testDb.prepare('UPDATE trip_files SET filename = ? WHERE id = ?').run('../../etc/passwd', fileId);
 
     const res = await request(app)
-      .get(`/api/trips/${trip.id}/files/1/download`)
-      .set('Authorization', `Bearer ${generateToken(user.id)}`);
-    // Trip 1 does not exist after resetTestDb → 404 before any file path is evaluated
+      .get(`/api/trips/${trip.id}/files/${fileId}/download`)
+      .set(authHeader(user.id));
+    // path.basename() strips traversal in the download controller; the normalized
+    // name does not exist in uploads, so the answer is the same 404 a missing file
+    // gets. Pinned exactly: a 500 from a thrown guard would also be "not 200".
     expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'File not found' });
   });
 });

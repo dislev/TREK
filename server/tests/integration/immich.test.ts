@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 
 const { testDb, dbMock } = vi.hoisted(() => {
   const Database = require('better-sqlite3');
@@ -38,7 +39,12 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
 // Mock SSRF guard: block loopback and private IPs, allow external hostnames without DNS.
 vi.mock('../../src/utils/ssrfGuard', async () => {
@@ -64,28 +70,32 @@ vi.mock('../../src/utils/ssrfGuard', async () => {
   };
 });
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
+import { resetTestDb, resetRateLimits, setAddonEnabled } from '../helpers/test-db';
 import { createUser } from '../helpers/factories';
 import { authCookie } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
 });
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
+  // Providers only count as enabled under an enabled journey addon (migration 84 seeds it off).
+  setAddonEnabled(testDb, 'journey', true);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
   testDb.close();
 });
 
@@ -190,11 +200,16 @@ describe('Immich album links', () => {
       .get(trip.id, user.id, 'album-xyz', 'Album XYZ', 'immich') as any;
 
     // Insert photos synced from the album
-    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, asset_id, provider, shared, album_link_id) VALUES (?, ?, ?, ?, 1, ?)').run(trip.id, user.id, 'asset-001', 'immich', linkResult.id);
-    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, asset_id, provider, shared, album_link_id) VALUES (?, ?, ?, ?, 1, ?)').run(trip.id, user.id, 'asset-002', 'immich', linkResult.id);
+    for (const assetId of ['asset-001', 'asset-002']) {
+      testDb.prepare('INSERT OR IGNORE INTO trek_photos (provider, asset_id, owner_id) VALUES (?, ?, ?)').run('immich', assetId, user.id);
+      const tkp = testDb.prepare('SELECT id FROM trek_photos WHERE provider = ? AND asset_id = ? AND owner_id = ?').get('immich', assetId, user.id) as any;
+      testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, photo_id, shared, album_link_id) VALUES (?, ?, ?, 1, ?)').run(trip.id, user.id, tkp.id, linkResult.id);
+    }
 
     // Insert an individually-added photo (no album_link_id)
-    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, asset_id, provider, shared) VALUES (?, ?, ?, ?, 1)').run(trip.id, user.id, 'asset-manual', 'immich');
+    testDb.prepare('INSERT OR IGNORE INTO trek_photos (provider, asset_id, owner_id) VALUES (?, ?, ?)').run('immich', 'asset-manual', user.id);
+    const tkpManual = testDb.prepare('SELECT id FROM trek_photos WHERE provider = ? AND asset_id = ? AND owner_id = ?').get('immich', 'asset-manual', user.id) as any;
+    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, photo_id, shared) VALUES (?, ?, ?, 1)').run(trip.id, user.id, tkpManual.id);
 
     const res = await request(app)
       .delete(`/api/integrations/memories/unified/trips/${trip.id}/album-links/${linkResult.id}`)
@@ -204,7 +219,11 @@ describe('Immich album links', () => {
     expect(res.body.success).toBe(true);
 
     // Album-linked photos should be gone
-    const remainingPhotos = testDb.prepare('SELECT * FROM trip_photos WHERE trip_id = ?').all(trip.id) as any[];
+    const remainingPhotos = testDb.prepare(`
+      SELECT tp.*, tkp.asset_id FROM trip_photos tp
+      JOIN trek_photos tkp ON tkp.id = tp.photo_id
+      WHERE tp.trip_id = ?
+    `).all(trip.id) as any[];
     expect(remainingPhotos.length).toBe(1);
     expect(remainingPhotos[0].asset_id).toBe('asset-manual');
 
@@ -220,7 +239,9 @@ describe('Immich album links', () => {
 
     const linkResult = testDb.prepare('INSERT INTO trip_album_links (trip_id, user_id, album_id, album_name, provider) VALUES (?, ?, ?, ?, ?) RETURNING *')
       .get(trip.id, owner.id, 'album-secret', 'Secret Album', 'immich') as any;
-    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, asset_id, provider, shared, album_link_id) VALUES (?, ?, ?, ?, 1, ?)').run(trip.id, owner.id, 'asset-owned', 'immich', linkResult.id);
+    testDb.prepare('INSERT OR IGNORE INTO trek_photos (provider, asset_id, owner_id) VALUES (?, ?, ?)').run('immich', 'asset-owned', owner.id);
+    const tkpOwned = testDb.prepare('SELECT id FROM trek_photos WHERE provider = ? AND asset_id = ? AND owner_id = ?').get('immich', 'asset-owned', owner.id) as any;
+    testDb.prepare('INSERT INTO trip_photos (trip_id, user_id, photo_id, shared, album_link_id) VALUES (?, ?, ?, 1, ?)').run(trip.id, owner.id, tkpOwned.id, linkResult.id);
 
     // Non-member tries to delete owner's album link — should be denied
     const res = await request(app)
@@ -232,7 +253,11 @@ describe('Immich album links', () => {
     // Link and photos should still exist
     const link = testDb.prepare('SELECT * FROM trip_album_links WHERE id = ?').get(linkResult.id);
     expect(link).toBeDefined();
-    const photo = testDb.prepare('SELECT * FROM trip_photos WHERE asset_id = ?').get('asset-owned');
+    const photo = testDb.prepare(`
+      SELECT tp.* FROM trip_photos tp
+      JOIN trek_photos tkp ON tkp.id = tp.photo_id
+      WHERE tkp.asset_id = ?
+    `).get('asset-owned');
     expect(photo).toBeDefined();
   });
 

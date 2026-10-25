@@ -1,8 +1,11 @@
 import React, { useMemo } from 'react'
+import { avatarSrc } from '../../utils/avatarSrc'
 import { useTripStore } from '../../store/tripStore'
 import { useSettingsStore } from '../../store/settingsStore'
 import { useTranslation } from '../../i18n'
-import { MapPin, Clock, Calendar, Users, Sparkles } from 'lucide-react'
+import { MapPin, Clock, Users, Sparkles } from 'lucide-react'
+import EmptyState from '../shared/EmptyState'
+import { localToday } from '../Planner/today'
 
 function formatTime(timeStr, is12h) {
   if (!timeStr) return ''
@@ -16,12 +19,14 @@ function formatTime(timeStr, is12h) {
 }
 
 function formatDayLabel(date, t, locale) {
-  const d = new Date(date + 'T00:00:00')
   const now = new Date()
-  const tomorrow = new Date(); tomorrow.setDate(now.getDate() + 1)
+  // Day dates are plain calendar strings, so "today"/"tomorrow" have to be
+  // compared against the local calendar day, not the UTC one.
+  const nowDate = localToday(now)
+  const tomorrowDate = localToday(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1))
 
-  if (d.toDateString() === now.toDateString()) return t('collab.whatsNext.today') || 'Today'
-  if (d.toDateString() === tomorrow.toDateString()) return t('collab.whatsNext.tomorrow') || 'Tomorrow'
+  if (date === nowDate) return t('collab.whatsNext.today') || 'Today'
+  if (date === tomorrowDate) return t('collab.whatsNext.tomorrow') || 'Tomorrow'
 
   return new Date(date + 'T00:00:00Z').toLocaleDateString(locale || undefined, { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' })
 }
@@ -29,6 +34,7 @@ function formatDayLabel(date, t, locale) {
 interface TripMember {
   id: number
   username: string
+  avatar?: string | null
   avatar_url?: string | null
 }
 
@@ -43,7 +49,7 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
 
   const upcoming = useMemo(() => {
     const now = new Date()
-    const nowDate = now.toISOString().split('T')[0]
+    const nowDate = localToday(now)
     const nowTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
     const items = []
 
@@ -89,7 +95,7 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
         padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0,
       }}>
         <Sparkles size={14} color="var(--text-faint)" />
-        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', letterSpacing: 0.3, textTransform: 'uppercase' }}>
+        <span style={{ fontSize: 'calc(12px * var(--fs-scale-body, 1))', fontWeight: 600, color: 'var(--text-muted)', letterSpacing: 0.3, textTransform: 'uppercase' }}>
           {t('collab.whatsNext.title') || "What's Next"}
         </span>
       </div>
@@ -97,11 +103,7 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
       {/* List */}
       <div className="chat-scroll" style={{ flex: 1, overflowY: 'auto', padding: '8px 10px' }}>
         {upcoming.length === 0 ? (
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', padding: '48px 20px', textAlign: 'center' }}>
-            <Calendar size={36} color="var(--text-faint)" strokeWidth={1.3} style={{ marginBottom: 12 }} />
-            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 4 }}>{t('collab.whatsNext.empty')}</div>
-            <div style={{ fontSize: 12, color: 'var(--text-faint)' }}>{t('collab.whatsNext.emptyHint')}</div>
-          </div>
+          <EmptyState scene="guide" title={t('collab.whatsNext.empty')} />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {upcoming.map((item, idx) => {
@@ -112,7 +114,7 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
                 <React.Fragment key={item.id}>
                   {showDayHeader && (
                     <div style={{
-                      fontSize: 10, fontWeight: 500, color: 'var(--text-faint)',
+                      fontSize: 'calc(10px * var(--fs-scale-caption, 1))', fontWeight: 500, color: 'var(--text-faint)',
                       textTransform: 'uppercase', letterSpacing: 0.5,
                       padding: idx === 0 ? '0 4px 4px' : '8px 4px 4px',
                     }}>
@@ -130,15 +132,15 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
                   >
                     {/* Time column */}
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minWidth: 44, flexShrink: 0 }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', lineHeight: 1 }}>
+                      <span style={{ fontSize: 'calc(11px * var(--fs-scale-caption, 1))', fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', lineHeight: 1 }}>
                         {item.time ? formatTime(item.time, is12h) : 'TBD'}
                       </span>
                       {item.endTime && (
                         <>
-                          <span style={{ fontSize: 7, color: 'var(--text-faint)', fontWeight: 600, letterSpacing: 0.3, margin: '2px 0', textTransform: 'uppercase' }}>
+                          <span style={{ fontSize: 'calc(7px * var(--fs-scale-caption, 1))', color: 'var(--text-faint)', fontWeight: 600, letterSpacing: 0.3, margin: '2px 0', textTransform: 'uppercase' }}>
                             {t('collab.whatsNext.until') || 'bis'}
                           </span>
-                          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', lineHeight: 1 }}>
+                          <span style={{ fontSize: 'calc(11px * var(--fs-scale-caption, 1))', fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', lineHeight: 1 }}>
                             {formatTime(item.endTime, is12h)}
                           </span>
                         </>
@@ -150,13 +152,13 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
 
                     {/* Details */}
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <div style={{ fontSize: 'calc(12px * var(--fs-scale-body, 1))', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {item.name}
                       </div>
                       {item.address && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 2 }}>
                           <MapPin size={9} color="var(--text-faint)" style={{ flexShrink: 0 }} />
-                          <span style={{ fontSize: 10, color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          <span style={{ fontSize: 'calc(10px * var(--fs-scale-caption, 1))', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                             {item.address}
                           </span>
                         </div>
@@ -173,15 +175,15 @@ export default function WhatsNextWidget({ tripMembers = [] }: WhatsNextWidgetPro
                               <div style={{
                                 width: 16, height: 16, borderRadius: '50%', background: 'var(--bg-secondary)',
                                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                fontSize: 7, fontWeight: 700, color: 'var(--text-muted)',
+                                fontSize: 'calc(7px * var(--fs-scale-caption, 1))', fontWeight: 700, color: 'var(--text-muted)',
                                 overflow: 'hidden', flexShrink: 0,
                               }}>
                                 {p.avatar
-                                  ? <img src={`/uploads/avatars/${p.avatar}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                  ? <img src={avatarSrc(p.avatar)!} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                                   : p.username?.[0]?.toUpperCase()
                                 }
                               </div>
-                              <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>{p.username}</span>
+                              <span style={{ fontSize: 'calc(10px * var(--fs-scale-caption, 1))', fontWeight: 500, color: 'var(--text-muted)' }}>{p.username}</span>
                             </div>
                           ))}
                         </div>

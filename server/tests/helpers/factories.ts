@@ -6,11 +6,13 @@
 
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
-import { encryptMfaSecret } from '../../src/services/mfaCrypto';
-import { encrypt_api_key } from '../../src/services/apiKeyCrypto';
+import { encryptMfaSecret } from '../../src/nest/common/crypto/mfaCrypto';
+import { encrypt_api_key } from '../../src/nest/common/crypto/apiKeyCrypto';
 
 let _userSeq = 0;
 let _tripSeq = 0;
+let _categorySeq = 0;
+let _tagSeq = 0;
 
 // ---------------------------------------------------------------------------
 // Users
@@ -97,7 +99,11 @@ export function createTrip(
     const end = new Date(overrides.end_date);
     const tripId = result.lastInsertRowid as number;
     let dayNumber = 1;
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    // Step in UTC. A date-only ISO string parses as UTC midnight, but setDate()
+    // advances local wall-clock time — 23h or 25h across a DST transition — so the
+    // instant drifts off midnight and toISOString() then reports the wrong day:
+    // one is dropped in autumn, one repeated in spring. CI runs UTC and never sees it.
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
       const dateStr = d.toISOString().slice(0, 10);
       db.prepare('INSERT INTO days (trip_id, day_number, date) VALUES (?, ?, ?)').run(tripId, dayNumber++, dateStr);
     }
@@ -277,11 +283,11 @@ export function createDayNote(
   db: Database.Database,
   dayId: number,
   tripId: number,
-  overrides: Partial<{ text: string; time: string; icon: string }> = {}
+  overrides: Partial<{ text: string; time: string; icon: string; sort_order: number }> = {}
 ): TestDayNote {
   const result = db.prepare(
-    'INSERT INTO day_notes (day_id, trip_id, text, time, icon, sort_order) VALUES (?, ?, ?, ?, ?, 9999)'
-  ).run(dayId, tripId, overrides.text ?? 'Test note', overrides.time ?? null, overrides.icon ?? '📝');
+    'INSERT INTO day_notes (day_id, trip_id, text, time, icon, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(dayId, tripId, overrides.text ?? 'Test note', overrides.time ?? null, overrides.icon ?? '📝', overrides.sort_order ?? 9999);
   return db.prepare('SELECT * FROM day_notes WHERE id = ?').get(result.lastInsertRowid) as TestDayNote;
 }
 
@@ -317,6 +323,32 @@ export function createCollabNote(
     overrides.color ?? '#6366f1'
   );
   return db.prepare('SELECT * FROM collab_notes WHERE id = ?').get(result.lastInsertRowid) as TestCollabNote;
+}
+
+// ---------------------------------------------------------------------------
+// Todo Items
+// ---------------------------------------------------------------------------
+
+export interface TestTodoItem {
+  id: number;
+  trip_id: number;
+  name: string;
+  checked: number;
+  category: string | null;
+  sort_order: number;
+}
+
+export function createTodoItem(
+  db: Database.Database,
+  tripId: number,
+  overrides: Partial<{ name: string; category: string; checked: number }> = {}
+): TestTodoItem {
+  const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM todo_items WHERE trip_id = ?').get(tripId) as { max: number | null };
+  const sortOrder = (maxOrder.max !== null ? maxOrder.max : -1) + 1;
+  const result = db.prepare(
+    'INSERT INTO todo_items (trip_id, name, checked, category, sort_order) VALUES (?, ?, ?, ?, ?)'
+  ).run(tripId, overrides.name ?? 'Test Todo', overrides.checked ?? 0, overrides.category ?? null, sortOrder);
+  return db.prepare('SELECT * FROM todo_items WHERE id = ?').get(result.lastInsertRowid) as TestTodoItem;
 }
 
 // ---------------------------------------------------------------------------
@@ -530,10 +562,23 @@ export function addTripPhoto(
   provider: string,
   opts: { shared?: boolean; albumLinkId?: number } = {}
 ): TestTripPhoto {
+  // Insert into trek_photos first (central registry)
+  db.prepare(
+    'INSERT OR IGNORE INTO trek_photos (provider, asset_id, owner_id) VALUES (?, ?, ?)'
+  ).run(provider, assetId, userId);
+  const trekPhoto = db.prepare(
+    'SELECT id FROM trek_photos WHERE provider = ? AND asset_id = ? AND owner_id = ?'
+  ).get(provider, assetId, userId) as { id: number };
+
   const result = db.prepare(
-    'INSERT OR IGNORE INTO trip_photos (trip_id, user_id, asset_id, provider, shared, album_link_id) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(tripId, userId, assetId, provider, opts.shared ? 1 : 0, opts.albumLinkId ?? null);
-  return db.prepare('SELECT * FROM trip_photos WHERE id = ?').get(result.lastInsertRowid) as TestTripPhoto;
+    'INSERT OR IGNORE INTO trip_photos (trip_id, user_id, photo_id, shared, album_link_id) VALUES (?, ?, ?, ?, ?)'
+  ).run(tripId, userId, trekPhoto.id, opts.shared ? 1 : 0, opts.albumLinkId ?? null);
+  return db.prepare(`
+    SELECT tp.id, tp.trip_id, tp.user_id, tkp.asset_id, tkp.provider, tp.shared, tp.album_link_id
+    FROM trip_photos tp
+    JOIN trek_photos tkp ON tkp.id = tp.photo_id
+    WHERE tp.id = ?
+  `).get(result.lastInsertRowid) as TestTripPhoto;
 }
 
 export interface TestAlbumLink {
@@ -578,4 +623,130 @@ export function setSynologyCredentials(
 ): void {
   db.prepare('UPDATE users SET synology_url = ?, synology_username = ?, synology_password = ? WHERE id = ?')
     .run(url, username, encrypt_api_key(password), userId);
+}
+
+// ---------------------------------------------------------------------------
+// Categories
+// ---------------------------------------------------------------------------
+
+export function createCategory(
+  db: Database.Database,
+  overrides: { name?: string; color?: string; icon?: string; user_id?: number | null } = {}
+) {
+  const name = overrides.name ?? `Test Category ${++_categorySeq}`;
+  const color = overrides.color ?? '#6366f1';
+  const icon = overrides.icon ?? '📍';
+  const userId = overrides.user_id ?? null;
+  const result = db.prepare('INSERT INTO categories (name, color, icon, user_id) VALUES (?, ?, ?, ?)').run(name, color, icon, userId);
+  return db.prepare('SELECT * FROM categories WHERE id = ?').get(result.lastInsertRowid) as { id: number; name: string; color: string; icon: string; user_id: number | null };
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+export function createTag(
+  db: Database.Database,
+  userId: number,
+  overrides: { name?: string; color?: string } = {}
+) {
+  const name = overrides.name ?? `Test Tag ${++_tagSeq}`;
+  const color = overrides.color ?? '#10b981';
+  const result = db.prepare('INSERT INTO tags (user_id, name, color) VALUES (?, ?, ?)').run(userId, name, color);
+  return db.prepare('SELECT * FROM tags WHERE id = ?').get(result.lastInsertRowid) as { id: number; user_id: number; name: string; color: string };
+}
+
+// ---------------------------------------------------------------------------
+// Journeys
+// ---------------------------------------------------------------------------
+
+let _journeySeq = 0;
+
+export interface TestJourney {
+  id: number;
+  user_id: number;
+  title: string;
+  subtitle: string | null;
+  status: string;
+  cover_image: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createJourney(
+  db: Database.Database,
+  userId: number,
+  overrides: Partial<{ title: string; subtitle: string; status: string }> = {}
+): TestJourney {
+  _journeySeq++;
+  const title = overrides.title ?? `Test Journey ${_journeySeq}`;
+  const now = Date.now();
+  const result = db.prepare(
+    'INSERT INTO journeys (user_id, title, subtitle, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(userId, title, overrides.subtitle ?? null, overrides.status ?? 'active', now, now);
+
+  const journeyId = result.lastInsertRowid as number;
+
+  // Auto-add owner as contributor
+  db.prepare(
+    "INSERT INTO journey_contributors (journey_id, user_id, role, added_at) VALUES (?, ?, 'owner', ?)"
+  ).run(journeyId, userId, now);
+
+  return db.prepare('SELECT * FROM journeys WHERE id = ?').get(journeyId) as TestJourney;
+}
+
+export interface TestJourneyEntry {
+  id: number;
+  journey_id: number;
+  author_id: number;
+  type: string;
+  entry_date: string;
+  title: string | null;
+  story: string | null;
+  /** 0/1, as the column holds it. */
+  stats_excluded: number;
+}
+
+export function createJourneyEntry(
+  db: Database.Database,
+  journeyId: number,
+  authorId: number,
+  overrides: Partial<{ type: string; entry_date: string; title: string; story: string; location_name: string; mood: string; weather: string; stats_excluded: number }> = {}
+): TestJourneyEntry {
+  const now = Date.now();
+  const result = db.prepare(`
+    INSERT INTO journey_entries (journey_id, author_id, type, entry_date, title, story, location_name, mood, weather, stats_excluded, visibility, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private', 0, ?, ?)
+  `).run(
+    journeyId, authorId,
+    overrides.type ?? 'entry',
+    overrides.entry_date ?? '2026-01-15',
+    overrides.title ?? null,
+    overrides.story ?? null,
+    overrides.location_name ?? null,
+    overrides.mood ?? null,
+    overrides.weather ?? null,
+    overrides.stats_excluded ?? 0,
+    now, now
+  );
+  return db.prepare('SELECT * FROM journey_entries WHERE id = ?').get(result.lastInsertRowid) as TestJourneyEntry;
+}
+
+export function addJourneyContributor(
+  db: Database.Database,
+  journeyId: number,
+  userId: number,
+  role: 'editor' | 'viewer' = 'editor'
+): void {
+  db.prepare(
+    'INSERT OR IGNORE INTO journey_contributors (journey_id, user_id, role, added_at) VALUES (?, ?, ?, ?)'
+  ).run(journeyId, userId, role, Date.now());
+}
+
+export function linkTripToJourney(db: Database.Database, journeyId: number, tripId: number): void {
+  // The column is added_at, not linked_at — this helper had no callers until
+  // #1973 and so had never actually run against the schema.
+  db.prepare(
+    'INSERT OR IGNORE INTO journey_trips (journey_id, trip_id, added_at) VALUES (?, ?, ?)'
+  ).run(journeyId, tripId, Date.now());
 }

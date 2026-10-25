@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 
 const { testDb, dbMock } = vi.hoisted(() => {
   const Database = require('better-sqlite3');
@@ -35,30 +36,37 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
-import { createUser, createTrip, createDay, createPlace, addTripMember } from '../helpers/factories';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
+import { createUser, createTrip, createDay, createPlace, addTripMember, createTag } from '../helpers/factories';
 import { authCookie } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
 });
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
   testDb.close();
 });
 
@@ -75,6 +83,31 @@ function setupAssignmentFixtures(userId: number) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('Create assignment', () => {
+  it('sets a day end for one visit, preserves its times, and clears it again', async () => {
+    const { user } = createUser(testDb);
+    const { trip, day, place } = setupAssignmentFixtures(user.id);
+    const created = await request(app).post(`/api/trips/${trip.id}/days/${day.id}/assignments`)
+      .set('Cookie', authCookie(user.id)).send({ place_id: place.id });
+    const id = created.body.assignment.id;
+    const url = `/api/trips/${trip.id}/assignments/${id}/end-day`;
+    testDb.prepare('UPDATE day_assignments SET assignment_time = ? WHERE id = ?').run('07:00', id);
+    const changed = await request(app).put(url).set('Cookie', authCookie(user.id)).send({ end_day: true }).expect(200);
+    expect(changed.body.assignment).toMatchObject({ end_day: true, assignment_time: '07:00' });
+    const listed = await request(app).get(`/api/trips/${trip.id}/days`).set('Cookie', authCookie(user.id)).expect(200);
+    expect(listed.body.days[0].assignments[0].end_day).toBe(true);
+    const repeatedDay = createDay(testDb, trip.id, { day_number: 2 });
+    const repeated = await request(app).post(`/api/trips/${trip.id}/days/${repeatedDay.id}/assignments`)
+      .set('Cookie', authCookie(user.id)).send({ place_id: place.id }).expect(201);
+    expect(repeated.body.assignment.end_day).toBe(false);
+    await request(app).put(url).set('Cookie', authCookie(user.id)).send({ end_day: 'true' }).expect(400);
+    const foreign = createTrip(testDb, user.id);
+    await request(app).put(`/api/trips/${foreign.id}/assignments/${id}/end-day`).set('Cookie', authCookie(user.id))
+      .send({ end_day: true }).expect(404);
+    const cleared = await request(app).put(url).set('Cookie', authCookie(user.id)).send({ end_day: false }).expect(200);
+    expect(cleared.body.assignment).toMatchObject({ end_day: false, assignment_time: '07:00' });
+    await request(app).put(url).send({ end_day: true }).expect(401);
+  });
+
   it('ASSIGN-001 — POST creates assignment linking place to day', async () => {
     const { user } = createUser(testDb);
     const { trip, day, place } = setupAssignmentFixtures(user.id);
@@ -183,6 +216,30 @@ describe('List assignments', () => {
     expect(res.body.assignments).toHaveLength(0);
   });
 
+  it('ASSIGN-003 — the embedded place carries osm_id so the day-plan thumbnail can auto-fetch (#1136)', async () => {
+    const { user } = createUser(testDb);
+    const { trip, day, place } = setupAssignmentFixtures(user.id);
+    testDb.prepare('UPDATE places SET osm_id = ? WHERE id = ?').run('node:42', place.id);
+
+    await request(app)
+      .post(`/api/trips/${trip.id}/days/${day.id}/assignments`)
+      .set('Cookie', authCookie(user.id))
+      .send({ place_id: place.id });
+
+    const res = await request(app)
+      .get(`/api/trips/${trip.id}/days/${day.id}/assignments`)
+      .set('Cookie', authCookie(user.id));
+    expect(res.status).toBe(200);
+    expect(res.body.assignments[0].place.osm_id).toBe('node:42');
+
+    // Also surfaced through the full trip-days bundle (the actual day-plan source).
+    const daysRes = await request(app)
+      .get(`/api/trips/${trip.id}/days`)
+      .set('Cookie', authCookie(user.id));
+    const embedded = daysRes.body.days.find((d: { id: number }) => d.id === day.id).assignments[0].place;
+    expect(embedded.osm_id).toBe('node:42');
+  });
+
   it('ASSIGN-006 — non-member cannot list assignments', async () => {
     const { user: owner } = createUser(testDb);
     const { user: other } = createUser(testDb);
@@ -261,6 +318,12 @@ describe('Reorder assignments', () => {
       .send({ orderedIds: [a2.body.assignment.id, a1.body.assignment.id] });
     expect(reorder.status).toBe(200);
     expect(reorder.body.success).toBe(true);
+
+    const rows = testDb
+      .prepare('SELECT id, order_index FROM day_assignments WHERE day_id = ? ORDER BY order_index')
+      .all(day.id) as Array<{ id: number; order_index: number }>;
+    expect(rows[0].id).toBe(a2.body.assignment.id);
+    expect(rows[1].id).toBe(a1.body.assignment.id);
   });
 });
 
@@ -319,6 +382,41 @@ describe('Assignment participants', () => {
       .set('Cookie', authCookie(user.id));
     expect(getParticipants.status).toBe(200);
     expect(getParticipants.body.participants).toHaveLength(2);
+  });
+
+  it('ASSIGN-010 — GET /assignments includes tags and participants when present', async () => {
+    const { user } = createUser(testDb);
+    const { user: member } = createUser(testDb);
+    const { trip, day, place } = setupAssignmentFixtures(user.id);
+    addTripMember(testDb, trip.id, member.id);
+
+    // Attach a tag to the place
+    const tag = createTag(testDb, user.id, { name: 'Must See' });
+    testDb.prepare('INSERT INTO place_tags (place_id, tag_id) VALUES (?, ?)').run(place.id, tag.id);
+
+    // Create the assignment via API
+    const create = await request(app)
+      .post(`/api/trips/${trip.id}/days/${day.id}/assignments`)
+      .set('Cookie', authCookie(user.id))
+      .send({ place_id: place.id });
+    expect(create.status).toBe(201);
+    const assignmentId = create.body.assignment.id;
+
+    // Add participants to the assignment
+    await request(app)
+      .put(`/api/trips/${trip.id}/assignments/${assignmentId}/participants`)
+      .set('Cookie', authCookie(user.id))
+      .send({ user_ids: [user.id, member.id] });
+
+    // List assignments — should include tags (compact) and participants
+    const res = await request(app)
+      .get(`/api/trips/${trip.id}/days/${day.id}/assignments`)
+      .set('Cookie', authCookie(user.id));
+    expect(res.status).toBe(200);
+    const found = (res.body.assignments as any[]).find((a: any) => a.id === assignmentId);
+    expect(found).toBeDefined();
+    expect(found.place.tags).toHaveLength(1);
+    expect(found.participants).toHaveLength(2);
   });
 
   it('ASSIGN-009 — PUT /time updates assignment time fields', async () => {

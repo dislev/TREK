@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import request from 'supertest';
 import type { Application } from 'express';
+import type { INestApplication } from '@nestjs/common';
 import path from 'path';
 import fs from 'fs';
 
@@ -42,26 +43,33 @@ vi.mock('../../src/config', () => ({
   JWT_SECRET: 'test-jwt-secret-for-trek-testing-only',
   ENCRYPTION_KEY: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2',
   updateJwtSecret: () => {},
+  SESSION_DURATION: '24h',
+  SESSION_DURATION_MS: 86400000,
+  SESSION_DURATION_SECONDS: 86400,
+  DEFAULT_LANGUAGE: 'en',
 }));
+vi.mock('../../src/websocket', () => ({ broadcast: vi.fn(), broadcastToUser: vi.fn() }));
 
-import { createApp } from '../../src/app';
+import { buildApp } from '../../src/bootstrap';
 import { createTables } from '../../src/db/schema';
 import { runMigrations } from '../../src/db/migrations';
-import { resetTestDb } from '../helpers/test-db';
-import { createUser, createTrip, createReservation, addTripMember } from '../helpers/factories';
+import { resetTestDb, resetRateLimits } from '../helpers/test-db';
+import { createUser, createTrip, createReservation, createPlace, addTripMember } from '../helpers/factories';
 import { authCookie, generateToken } from '../helpers/auth';
-import { loginAttempts, mfaAttempts } from '../../src/routes/auth';
 
-const app: Application = createApp();
+let nestApp: INestApplication;
+let app: Application;
 const FIXTURE_PDF = path.join(__dirname, '../fixtures/test.pdf');
 const FIXTURE_IMG = path.join(__dirname, '../fixtures/small-image.jpg');
 
 // Ensure uploads/files dir exists
 const uploadsDir = path.join(__dirname, '../../uploads/files');
 
-beforeAll(() => {
+beforeAll(async () => {
   createTables(testDb);
   runMigrations(testDb);
+  nestApp = await buildApp();
+  app = nestApp.getHttpAdapter().getInstance();
   if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
   // Seed allowed_file_types to include common types (wildcard)
   testDb.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('allowed_file_types', '*')").run();
@@ -69,14 +77,15 @@ beforeAll(() => {
 
 beforeEach(() => {
   resetTestDb(testDb);
-  loginAttempts.clear();
-  mfaAttempts.clear();
+  resetRateLimits(nestApp);
   // Re-seed allowed_file_types after reset
   testDb.prepare("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('allowed_file_types', '*')").run();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await nestApp.close();
   testDb.close();
+  fs.rmSync(uploadsDir, { recursive: true, force: true });
 });
 
 // Helper to upload a file and return the file object
@@ -117,9 +126,62 @@ describe('Upload file', () => {
         .set('Cookie', authCookie(user.id))
         .attach('file', svgPath);
       expect(res.status).toBe(400);
+      // The error is an i18n key the client resolves via t() (issue #1363).
+      expect(res.body.error).toBe('files.uploadErrorType');
     } finally {
       if (fs.existsSync(svgPath)) fs.unlinkSync(svgPath);
     }
+  });
+
+  it('FILE-P01 — stored filename is a bare uuid name and the bytes land in uploads/files', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+
+    const res = await uploadFile(trip.id, user.id, FIXTURE_PDF);
+    expect(res.status).toBe(201);
+    expect(res.body.file.filename).toMatch(/^[0-9a-f-]{36}\.pdf$/);
+    expect(fs.existsSync(path.join(uploadsDir, res.body.file.filename))).toBe(true);
+    // Nothing left behind in the spool after a successful commit.
+    const spoolDir = path.join(__dirname, '../../uploads/.tmp');
+    if (fs.existsSync(spoolDir)) {
+      expect(fs.readdirSync(spoolDir)).not.toContain(res.body.file.filename);
+    }
+  });
+
+  it('FILE-P02 — non-video over 50 MB is rejected with no bytes left anywhere', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+
+    const BIG = 51 * 1024 * 1024;
+    // Other suites share the real uploads/ tree when the whole tier runs in
+    // parallel, so the residue checks key on this upload's unique size rather
+    // than comparing whole-directory listings.
+    const bigFilesIn = (dir: string) =>
+      fs.existsSync(dir)
+        ? fs.readdirSync(dir).filter((f) => {
+            try { return fs.statSync(path.join(dir, f)).size === BIG; } catch { return false; }
+          })
+        : [];
+    const res = await request(app)
+      .post(`/api/trips/${trip.id}/files`)
+      .set('Cookie', authCookie(user.id))
+      .attach('file', Buffer.alloc(BIG), { filename: 'big.pdf', contentType: 'application/pdf' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('File is too large');
+    expect(bigFilesIn(uploadsDir)).toEqual([]);
+    expect(bigFilesIn(path.join(__dirname, '../../uploads/.tmp'))).toEqual([]);
+  });
+
+  it('FILE-P03 — non-ASCII original filenames are preserved (defParamCharset utf8)', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+
+    const res = await request(app)
+      .post(`/api/trips/${trip.id}/files`)
+      .set('Cookie', authCookie(user.id))
+      .attach('file', Buffer.from('utf8 name test'), { filename: 'résumé.pdf', contentType: 'application/pdf' });
+    expect(res.status).toBe(201);
+    expect(res.body.file.original_name).toBe('résumé.pdf');
   });
 
   it('FILE-021 — non-member cannot upload file', async () => {
@@ -349,6 +411,117 @@ describe('File links', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cross-trip link isolation (GHSA — reservation title disclosure)
+//
+// A file may only point at reservations / assignments / places from its own
+// trip. The reservation JOIN returns the reservation title, so a member of one
+// trip linking a file to another private trip's reservation id used to read the
+// foreign title back. Every write path (link, upload, update) must reject it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Cross-trip link isolation', () => {
+  it('SEC-FILE-LINK-001 — linking a file to a reservation from another trip is rejected (no title leak)', async () => {
+    const { user: attacker } = createUser(testDb);
+    const { user: victim } = createUser(testDb);
+    const attackerTrip = createTrip(testDb, attacker.id, { title: 'Attacker Trip' });
+    const victimTrip = createTrip(testDb, victim.id, { title: 'Victim Trip' });
+    const victimReservation = createReservation(testDb, victimTrip.id, { title: 'Victim Secret Flight', type: 'flight' });
+    const upload = await uploadFile(attackerTrip.id, attacker.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+
+    const link = await request(app)
+      .post(`/api/trips/${attackerTrip.id}/files/${fileId}/link`)
+      .set('Cookie', authCookie(attacker.id))
+      .send({ reservation_id: victimReservation.id });
+    expect(link.status).toBe(400);
+
+    // Nothing was stored, so the title cannot leak back through the links list.
+    const links = await request(app)
+      .get(`/api/trips/${attackerTrip.id}/files/${fileId}/links`)
+      .set('Cookie', authCookie(attacker.id));
+    expect(links.status).toBe(200);
+    expect(JSON.stringify(links.body)).not.toContain('Victim Secret Flight');
+    expect((links.body.links as any[]).some((l) => l.reservation_id === victimReservation.id)).toBe(false);
+  });
+
+  it('SEC-FILE-LINK-002 — uploading a file with a foreign reservation_id is rejected (no title leak)', async () => {
+    const { user: attacker } = createUser(testDb);
+    const { user: victim } = createUser(testDb);
+    const attackerTrip = createTrip(testDb, attacker.id);
+    const victimTrip = createTrip(testDb, victim.id);
+    const victimReservation = createReservation(testDb, victimTrip.id, { title: 'Victim Secret Flight', type: 'flight' });
+
+    const res = await request(app)
+      .post(`/api/trips/${attackerTrip.id}/files`)
+      .set('Cookie', authCookie(attacker.id))
+      .field('reservation_id', String(victimReservation.id))
+      .attach('file', FIXTURE_PDF);
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).not.toContain('Victim Secret Flight');
+  });
+
+  it('SEC-FILE-LINK-003 — updating a file with a foreign reservation_id is rejected (no title leak)', async () => {
+    const { user: attacker } = createUser(testDb);
+    const { user: victim } = createUser(testDb);
+    const attackerTrip = createTrip(testDb, attacker.id);
+    const victimTrip = createTrip(testDb, victim.id);
+    const victimReservation = createReservation(testDb, victimTrip.id, { title: 'Victim Secret Flight', type: 'flight' });
+    const upload = await uploadFile(attackerTrip.id, attacker.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+
+    const res = await request(app)
+      .put(`/api/trips/${attackerTrip.id}/files/${fileId}`)
+      .set('Cookie', authCookie(attacker.id))
+      .send({ reservation_id: victimReservation.id });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).not.toContain('Victim Secret Flight');
+  });
+
+  it('SEC-FILE-LINK-004 — linking a file to a place from another trip is rejected', async () => {
+    const { user: attacker } = createUser(testDb);
+    const { user: victim } = createUser(testDb);
+    const attackerTrip = createTrip(testDb, attacker.id);
+    const victimTrip = createTrip(testDb, victim.id);
+    const victimPlace = createPlace(testDb, victimTrip.id, { name: 'Victim Secret Place' });
+    const upload = await uploadFile(attackerTrip.id, attacker.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+
+    const link = await request(app)
+      .post(`/api/trips/${attackerTrip.id}/files/${fileId}/link`)
+      .set('Cookie', authCookie(attacker.id))
+      .send({ place_id: victimPlace.id });
+    expect(link.status).toBe(400);
+
+    const links = await request(app)
+      .get(`/api/trips/${attackerTrip.id}/files/${fileId}/links`)
+      .set('Cookie', authCookie(attacker.id));
+    expect((links.body.links as any[]).some((l) => l.place_id === victimPlace.id)).toBe(false);
+  });
+
+  it('SEC-FILE-LINK-005 — same-trip reservation links and uploads still succeed', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+    const resv = createReservation(testDb, trip.id, { title: 'My Own Flight', type: 'flight' });
+
+    // Upload carrying the trip's own reservation id is accepted.
+    const upload = await request(app)
+      .post(`/api/trips/${trip.id}/files`)
+      .set('Cookie', authCookie(user.id))
+      .field('reservation_id', String(resv.id))
+      .attach('file', FIXTURE_PDF);
+    expect(upload.status).toBe(201);
+    const fileId = upload.body.file.id;
+
+    // And linking it to the same reservation works.
+    const link = await request(app)
+      .post(`/api/trips/${trip.id}/files/${fileId}/link`)
+      .set('Cookie', authCookie(user.id))
+      .send({ reservation_id: resv.id });
+    expect(link.status).toBe(200);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Download
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -364,13 +537,12 @@ describe('File download', () => {
     expect(res.status).toBe(401);
   });
 
-  it('FILE-008 — GET /:id/download with Bearer JWT downloads or 404s (no physical file in tests)', async () => {
+  it('FILE-008 — GET /:id/download with Bearer JWT downloads file', async () => {
     const { user } = createUser(testDb);
     const trip = createTrip(testDb, user.id);
     const upload = await uploadFile(trip.id, user.id, FIXTURE_PDF);
     const fileId = upload.body.file.id;
 
-    // authenticateDownload accepts a signed JWT as Bearer token
     const token = generateToken(user.id);
 
     const dl = await request(app)
@@ -378,5 +550,79 @@ describe('File download', () => {
       .set('Authorization', `Bearer ${token}`);
     // multer stores the file to disk during uploadFile — physical file exists
     expect(dl.status).toBe(200);
+  });
+
+  it('FILE-011 — GET /:id/download with trek_session cookie downloads file', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+    const upload = await uploadFile(trip.id, user.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+
+    const token = generateToken(user.id);
+
+    const dl = await request(app)
+      .get(`/api/trips/${trip.id}/files/${fileId}/download`)
+      .set('Cookie', `trek_session=${token}`);
+    expect(dl.status).toBe(200);
+  });
+
+  it('FILE-P04 — download serves the exact bytes with Content-Type, ETag, and Range support', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+    const upload = await uploadFile(trip.id, user.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+    const fixtureBytes = fs.readFileSync(FIXTURE_PDF);
+
+    const dl = await request(app)
+      .get(`/api/trips/${trip.id}/files/${fileId}/download`)
+      .set('Cookie', authCookie(user.id));
+    expect(dl.status).toBe(200);
+    expect(dl.headers['content-type']).toBe('application/pdf');
+    expect(dl.headers.etag).toMatch(/^W\/"[0-9a-f]+-[0-9a-f]+"$/);
+    expect(Buffer.from(dl.body).equals(fixtureBytes)).toBe(true);
+
+    const ranged = await request(app)
+      .get(`/api/trips/${trip.id}/files/${fileId}/download`)
+      .set('Cookie', authCookie(user.id))
+      .set('Range', 'bytes=0-3');
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers['content-range']).toBe(`bytes 0-3/${fixtureBytes.length}`);
+  });
+
+  it('FILE-P05 — Apple Wallet passes are served inline with the canonical MIME types', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+
+    for (const [ext, mime] of [
+      ['pkpass', 'application/vnd.apple.pkpass'],
+      ['pkpasses', 'application/vnd.apple.pkpasses'],
+    ] as const) {
+      const upload = await request(app)
+        .post(`/api/trips/${trip.id}/files`)
+        .set('Cookie', authCookie(user.id))
+        .attach('file', Buffer.from('PK-wallet-bytes'), `pass.${ext}`);
+      expect(upload.status).toBe(201);
+
+      const dl = await request(app)
+        .get(`/api/trips/${trip.id}/files/${upload.body.file.id}/download`)
+        .set('Cookie', authCookie(user.id));
+      expect(dl.status).toBe(200);
+      expect(dl.headers['content-type']).toBe(mime);
+      expect(dl.headers['content-disposition']).toBe(`inline; filename="pass.${ext}"`);
+    }
+  });
+
+  it('FILE-P06 — a DB row whose bytes are gone answers 404 File not found', async () => {
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id);
+    const upload = await uploadFile(trip.id, user.id, FIXTURE_PDF);
+    const fileId = upload.body.file.id;
+    fs.rmSync(path.join(uploadsDir, upload.body.file.filename), { force: true });
+
+    const dl = await request(app)
+      .get(`/api/trips/${trip.id}/files/${fileId}/download`)
+      .set('Cookie', authCookie(user.id));
+    expect(dl.status).toBe(404);
+    expect(dl.body).toEqual({ error: 'File not found' });
   });
 });
