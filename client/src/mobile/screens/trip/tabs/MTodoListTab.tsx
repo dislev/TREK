@@ -1,26 +1,21 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { Calendar, Check, ChevronRight, Flag, Plus } from 'lucide-react'
 import MDancingTrek from '../../../components/MDancingTrek'
+import MChipStrip from '../../../components/MChipStrip'
 import { useAuthStore } from '../../../../store/authStore'
 import { useTranslation } from '../../../../i18n'
 import { avatarSrc } from '../../../../utils/avatarSrc'
 import { formatDate } from '../../../../utils/formatters'
-import { localToday } from '../../../../components/Planner/today'
 import type { TodoItem, TripMember } from '../../../../types'
 import type { TripPlanner } from '../MTripShell'
-import { TabScroller } from './tabChrome'
-import {
-  PRIORITY_COLOR, PRIORITY_LABEL, filterTodoItems, filterTodoItemsByCategory, isTodoOverdue,
-  sortTodoRows, todoCategories, todoCategoryOpenCount, todoCounts, type TodoSmartFilter,
-} from './listsModel'
+import { CardGrid, TabPanes } from './tabChrome'
+import MTodoSidebar from './MTodoSidebar'
+import { useIsSplit } from '../../../../hooks/sizeClass'
+import { PRIORITY_COLOR, PRIORITY_LABEL } from './listsModel'
+import { TODO_SMART_FILTERS, isTodoOverdue, type TodoSmartFilter } from '../../../../components/Todo/todoListModel'
+import { useTodoView } from '../../../../components/Todo/useTodoList'
 import MTaskSheet from './MTaskSheet'
-
-const BUILTIN_FILTERS: TodoSmartFilter[] = ['all', 'my', 'overdue', 'done']
-
-// The rail holds two kinds of bucket: the four built-ins, addressed by id, and
-// the category buckets, addressed by name — so a category a user called "all"
-// or "done" gets its own bucket instead of the built-in one.
-type ActiveFilter = { kind: 'smart'; id: TodoSmartFilter } | { kind: 'category'; name: string }
+import MarkdownText from '../../../../components/shared/MarkdownText'
 
 /**
  * To-do sub-tab (spec 03 §4.5-4.7): progress card with "New task", the
@@ -35,26 +30,14 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
   const currentUserId = useAuthStore(s => s.user?.id) ?? null
   const tripMembers = planner.tripMembers
 
-  const [active, setActive] = useState<ActiveFilter>({ kind: 'smart', id: 'all' })
-  const [sortBy, setSortBy] = useState<'priority' | 'due' | null>(null)
+  // The rail addresses a category by name, so a category a user called "all"
+  // or "done" gets its own bucket instead of the built-in one.
+  const { active, setActive, sortBy, toggleSort, today, categories, rows, counts, catCount } =
+    useTodoView(items, currentUserId, { rankByStatus: true, pinToday: true })
   const [editingItemId, setEditingItemId] = useState<number | null>(null)
   const [creatingTask, setCreatingTask] = useState(false)
-
-  // The user's calendar day, not UTC's — an overdue task must turn overdue at
-  // the traveller's midnight, not eight hours either side of it.
-  const today = useMemo(() => localToday(), [])
-  const categories = useMemo(() => todoCategories(items), [items])
-  const counts = todoCounts(items, currentUserId, today)
-  const rows = useMemo(
-    () => sortTodoRows(
-      active.kind === 'category'
-        ? filterTodoItemsByCategory(items, active.name)
-        : filterTodoItems(items, active.id, currentUserId, today),
-      sortBy,
-      today,
-    ),
-    [items, active, currentUserId, today, sortBy],
-  )
+  // With room for two panes the filters become a pane of their own (MTodoSidebar).
+  const split = useIsSplit()
 
   const pct = items.length > 0 ? Math.round((counts.done / items.length) * 100) : 0
   const defaultCategoryForNew = active.kind === 'category' ? active.name : null
@@ -74,18 +57,40 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
   const filterCount = (f: TodoSmartFilter) =>
     f === 'all' ? counts.open : f === 'my' ? counts.my : f === 'overdue' ? counts.overdue : counts.done
 
-  return (
-    <TabScroller>
-      {/* ── Progress card (spec §4.5) ── */}
+  const sortPills = (
+    <>
+      <button
+        type="button"
+        onClick={() => toggleSort('priority')}
+        aria-pressed={sortBy === 'priority'}
+        className={filterPill(sortBy === 'priority')}
+      >
+        <Flag size={11} strokeWidth={2.2} />
+        {t('todo.priority')}
+      </button>
+      <button
+        type="button"
+        onClick={() => toggleSort('due')}
+        aria-pressed={sortBy === 'due'}
+        className={filterPill(sortBy === 'due')}
+      >
+        <Calendar size={11} strokeWidth={2.2} />
+        {t('todo.detail.dueDate')}
+      </button>
+    </>
+  )
+
+  const progressCard = (
+      /* ── Progress card (spec §4.5) ── */
       <div className="rounded-2xl border border-[color:var(--m-rowbr)] bg-[color:var(--m-ic)] px-[14px] py-[13px]">
         <div className="flex items-baseline gap-[7px]">
           <span className="font-geist text-[1rem] font-extrabold tabular-nums text-m-ink">{counts.done}/{items.length}</span>
-          <span className="font-geist text-[0.625rem] font-bold text-m-faint">{pct}% · {t('todo.completed')}</span>
+          <span className="font-geist text-[0.625rem] font-bold text-m-faint">{pct}% {t('todo.completed')}</span>
           {canEdit && (
             <button
               type="button"
               onClick={openCreate}
-              className="ml-auto flex items-center gap-1 rounded-full bg-m-act px-[12px] py-[5px] text-[0.6875rem] font-semibold text-m-actfg"
+              className="ms-auto flex items-center gap-1 rounded-full bg-m-act px-[12px] py-[5px] text-[0.6875rem] font-semibold text-m-actfg"
             >
               <Plus size={11} strokeWidth={2.4} />
               {t('todo.newItem')}
@@ -96,11 +101,44 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
           <div className="h-full rounded-full" style={{ width: `${pct}%`, background: 'var(--m-st-confirmed)' }} />
         </div>
       </div>
+  )
+
+  return (
+    <>
+    <TabPanes
+      asideLabel={t('todo.sidebar.tasks')}
+      aside={
+        <>
+          {progressCard}
+          {split && items.length > 0 && (
+            <MTodoSidebar
+              active={active}
+              onPick={setActive}
+              counts={counts}
+              categories={categories}
+              catCount={catCount}
+              smartLabel={filterLabel}
+              listsLabel={t('todo.sidebar.categories')}
+            />
+          )}
+        </>
+      }
+    >
+      {/* The list's own head beside the filters pane: what it shows, and its order. */}
+      {split && items.length > 0 && (
+        <div className="flex items-center gap-[6px]">
+          <h2 className="min-w-0 flex-1 truncate text-subtitle font-extrabold text-m-ink">
+            {active.kind === 'smart' ? filterLabel(active.id) : active.name}
+          </h2>
+          <span className="flex-none font-geist text-[length:calc(10px*var(--fs-scale-caption,1))] font-bold uppercase tracking-[.09em] text-m-faint">{t('todo.sidebar.sortBy')}</span>
+          {sortPills}
+        </div>
+      )}
 
       {/* ── Filters (spec §4.6) ── */}
-      {items.length > 0 && (
-        <div className="mt-[10px] flex items-center gap-[6px] overflow-x-auto whitespace-nowrap">
-          {BUILTIN_FILTERS.map(f => (
+      {!split && items.length > 0 && (
+        <MChipStrip className="mt-[10px] items-center gap-[6px] whitespace-nowrap">
+          {TODO_SMART_FILTERS.map(f => (
             <button
               key={f}
               type="button"
@@ -111,24 +149,7 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
               <span className="font-geist text-[0.5625rem] opacity-70">{filterCount(f)}</span>
             </button>
           ))}
-          <button
-            type="button"
-            onClick={() => setSortBy(v => v === 'priority' ? null : 'priority')}
-            aria-pressed={sortBy === 'priority'}
-            className={filterPill(sortBy === 'priority')}
-          >
-            <Flag size={11} strokeWidth={2.2} />
-            {t('todo.priority')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setSortBy(v => v === 'due' ? null : 'due')}
-            aria-pressed={sortBy === 'due'}
-            className={filterPill(sortBy === 'due')}
-          >
-            <Calendar size={11} strokeWidth={2.2} />
-            {t('todo.detail.dueDate')}
-          </button>
+          {sortPills}
           {categories.length > 0 && <span className="h-4 w-px flex-none bg-[color:var(--m-rowbr)]" />}
           {categories.map(cat => (
             <button
@@ -138,10 +159,10 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
               className={filterPill(active.kind === 'category' && active.name === cat)}
             >
               {cat}
-              <span className="font-geist text-[0.5625rem] opacity-70">{todoCategoryOpenCount(items, cat)}</span>
+              <span className="font-geist text-[0.5625rem] opacity-70">{catCount(cat)}</span>
             </button>
           ))}
-        </div>
+        </MChipStrip>
       )}
 
       {/* ── Task cards (spec §4.7) ── */}
@@ -155,17 +176,20 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
           {t('todo.emptyFiltered')}
         </div>
       ) : (
-        rows.map(item => (
-          <TaskCard
-            key={item.id}
-            item={item}
-            members={tripMembers}
-            today={today}
-            onToggle={toggleItem}
-            onOpen={openEdit}
-          />
-        ))
+        <CardGrid>
+          {rows.map(item => (
+            <TaskCard
+              key={item.id}
+              item={item}
+              members={tripMembers}
+              today={today}
+              onToggle={toggleItem}
+              onOpen={openEdit}
+            />
+          ))}
+        </CardGrid>
       )}
+    </TabPanes>
 
       <MTaskSheet
         planner={planner}
@@ -176,7 +200,7 @@ export default function MTodoListTab({ planner }: { planner: TripPlanner }) {
         defaultCategory={defaultCategoryForNew}
         onClose={closeSheet}
       />
-    </TabScroller>
+    </>
   )
 }
 
@@ -207,19 +231,19 @@ function TaskCard({ item, members, today, onToggle, onOpen }: {
         aria-label={item.name}
         aria-pressed={done}
         className={`mt-[1px] flex h-[19px] w-[19px] flex-none items-center justify-center rounded-[6px] border-[1.5px] ${
-          done ? 'border-m-act bg-m-act text-m-actfg' : 'border-[color:var(--m-rowbr)] text-transparent'
+          done ? 'border-m-act bg-m-act text-m-actfg' : 'border-[color:var(--m-checkbr)] text-transparent'
         }`}
       >
         <Check size={12} strokeWidth={3} />
       </button>
 
-      <button type="button" onClick={() => onOpen(item.id)} className="flex min-w-0 flex-1 items-start gap-[8px] text-left">
+      <button type="button" onClick={() => onOpen(item.id)} className="flex min-w-0 flex-1 items-start gap-[8px] text-start">
         <div className="min-w-0 flex-1">
           <div className={`truncate text-[0.8125rem] font-semibold ${done ? 'text-m-faint line-through opacity-45' : 'text-m-ink'}`}>
             {item.name}
           </div>
           {item.description && (
-            <div className="mt-[1px] truncate font-geist text-[0.625rem] text-m-faint">{item.description}</div>
+            <MarkdownText clamp className="mt-[1px] font-geist text-[0.625rem] text-m-faint">{item.description}</MarkdownText>
           )}
           {(item.priority > 0 || item.due_date || assignee) && (
             <div className="mt-[5px] flex flex-wrap items-center gap-[5px]">
@@ -240,7 +264,7 @@ function TaskCard({ item, members, today, onToggle, onOpen }: {
                 </span>
               )}
               {assignee && (
-                <span className="inline-flex items-center gap-[4px] rounded-full bg-[color:var(--m-ic)] py-[2px] pl-[3px] pr-2 font-geist text-[0.59375rem] font-bold text-m-muted">
+                <span className="inline-flex items-center gap-[4px] rounded-full bg-[color:var(--m-ic)] py-[2px] ps-[3px] pe-2 font-geist text-[0.59375rem] font-bold text-m-muted">
                   <span className="flex h-[13px] w-[13px] flex-none items-center justify-center overflow-hidden rounded-full bg-m-act text-[0.4375rem] font-extrabold text-m-actfg">
                     {avatarSrcUrl ? <img src={avatarSrcUrl} alt="" className="h-full w-full object-cover" /> : assignee.username[0]?.toUpperCase()}
                   </span>

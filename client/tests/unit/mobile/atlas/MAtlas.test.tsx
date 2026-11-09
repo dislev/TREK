@@ -133,7 +133,8 @@ describe('MAtlas', () => {
     render(<MAtlas />);
 
     expect(await screen.findByText('Japan')).toBeInTheDocument();
-    expect(screen.getByText('2 atlas.places · 2 atlas.trips')).toBeInTheDocument();
+    expect(screen.getAllByText((_, el) => el?.textContent?.trim() === '2 atlas.places:2').length).toBeGreaterThan(0);
+    expect(screen.getAllByText((_, el) => el?.textContent?.trim() === '2 atlas.trips:2').length).toBeGreaterThan(0);
     expect(screen.getByText('Kansai')).toBeInTheDocument();
   });
 
@@ -224,11 +225,11 @@ describe('MAtlas', () => {
   it('FE-MOB-ATLASSCR-017: the planned pill stays away while nothing is planned', () => {
     render(<MAtlas />);
 
-    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'atlas.showPlanned' })).not.toBeInTheDocument();
     expect(screen.queryByText('atlas.planned')).not.toBeInTheDocument();
   });
 
-  it('FE-MOB-ATLASSCR-018: a planned country brings up the pill and its switch flips the layer', () => {
+  it('FE-MOB-ATLASSCR-018: a planned country brings up a header button that flips the layer', () => {
     const atlas = setAtlas({
       data: buildAtlasData({
         stats: { totalTrips: 4, totalPlaces: 21, totalCountries: 7, totalDays: 30, totalCities: 9, totalCountriesPlanned: 2 },
@@ -237,8 +238,9 @@ describe('MAtlas', () => {
     render(<MAtlas />);
 
     expect(screen.getByText('atlas.planned')).toBeInTheDocument();
-    const toggle = screen.getByRole('switch', { name: 'atlas.showPlanned' });
-    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    // A button of the same shape as the wishlist one, pressed while the layer shows.
+    const toggle = screen.getByRole('button', { name: 'atlas.showPlanned' });
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(toggle);
     expect(atlas.togglePlanned).toHaveBeenCalled();
