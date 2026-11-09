@@ -23,5 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Potvrzení',
   'day.editAccommodation': 'Upravit ubytování',
   'day.reservations': 'Rezervace',
+  'day.dailyNote': 'Poznámka k dni',
 };
 export default day;

@@ -1,4 +1,9 @@
-import React, { useEffect, useRef, useId, type ReactNode } from 'react'
+import React, { useEffect, useRef, useId, useState, type ReactNode } from 'react'
+import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
+import NoteFormatToolbar from '../shared/NoteFormatToolbar'
+import { markdownLinkComponents } from '../shared/markdownLink'
 import { X, CloudRain, Wind, Droplets, Sunrise, Sunset, Hotel, Calendar, MapPin, LogIn, LogOut, Pencil, ChevronsDown, ChevronsUp, ArrowRight, Check, Moon, type LucideIcon } from 'lucide-react'
 import type { WeatherResult } from '@trek/shared'
 import { usePluginViewContributions, PluginCardFooter } from '../Plugins/PluginContributions'
@@ -22,7 +27,7 @@ import { dayBookings, stayDayLabel, toDisplayTemp } from './dayDetailModel'
 import { pinnedAwayIn } from '../../utils/dayMerge'
 import { stayDayOptions, stayFormFrom, stayPlaceChoices, stayRangeFromEnd, stayRangeFromStart } from './stayFormModel'
 import { DialogShell, DialogHeader, DialogSection, DialogFooter, DialogButton, FooterSpacer, NEUTRAL_TINT, PILL, fs } from '../shared/DialogShell'
-import { INPUT, PANEL, EditorField, AddRowButton, PillSelect } from '../shared/dialogParts'
+import { INPUT, PANEL, TEXTAREA, EditorField, AddRowButton, PillSelect } from '../shared/dialogParts'
 import { BOX, Eyebrow, Field, RoundAction, TypeTile, toneOf, toneColor, toneTint } from './bookings/bookingParts'
 import { SoftPill, TimePill, tintOf } from './planParts'
 import { typeInfo } from './bookings/bookingsModel'
@@ -247,6 +252,8 @@ export default function DayDetailPanel({ day, days, places, categories = [], tri
 
           {dayContributions.length > 0 && <PluginCardFooter items={dayContributions} tripId={tripId} />}
 
+          <DailyNote key={day.id} day={day} tripId={tripId} canEdit={canEditDays} />
+
           <DayReservations day={day} days={days} assignments={assignments} reservations={reservations} is12h={is12h} onOpen={onOpenBooking} />
 
           <DialogSection label={t('day.accommodation')}>
@@ -384,6 +391,78 @@ function DayWeather({ weather, loading, isFahrenheit, placeName }: { weather: We
 
       {weather.type === 'climate' && <p className="m-0 italic text-content-faint" style={fs(10.5)}>{t('day.climateHint')}</p>}
     </section>
+  )
+}
+
+/**
+ * The day's own note, kept apart from the note entries that sit in the day's
+ * timeline: an entry is a short, titled card, the daily note is the longer
+ * write-up for the whole day (the `days.notes` column). Shown as Markdown,
+ * edited in place (keyed by day, so a draft never follows the panel to another day); the section stays out of the way when there is nothing to
+ * show and the viewer cannot edit.
+ */
+function DailyNote({ day, tripId, canEdit }: { day: Day; tripId: number; canEdit: boolean }) {
+  const { t } = useTranslation()
+  const toast = useToast()
+  const updateDayNotes = useTripStore((s) => s.updateDayNotes)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const areaRef = useRef<HTMLTextAreaElement | null>(null)
+  const saved = day.notes || ''
+
+  if (!saved && !canEdit) return null
+
+  const start = () => { setDraft(saved); setEditing(true) }
+  const save = async () => {
+    setSaving(true)
+    try {
+      await updateDayNotes(tripId, day.id, draft.trim())
+      setEditing(false)
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : t('common.unknownError'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <DialogSection label={t('day.dailyNote')}>
+      {editing ? (
+        <div className="flex flex-col gap-2">
+          <NoteFormatToolbar textareaRef={areaRef} onChange={setDraft} compact />
+          <textarea ref={areaRef} value={draft} rows={6} autoFocus
+            aria-label={t('day.dailyNote')}
+            onChange={e => setDraft(e.target.value)}
+            placeholder={t('notes.bodyPlaceholder')}
+            className={`${TEXTAREA} resize-y`} />
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-content-faint" style={fs(10.5)}>{t('notes.markdownHint')}</span>
+            <div className="flex gap-2">
+              <DialogButton onClick={() => setEditing(false)}>{t('common.cancel')}</DialogButton>
+              <DialogButton variant="primary" onClick={() => { void save() }} disabled={saving}>{t('common.save')}</DialogButton>
+            </div>
+          </div>
+        </div>
+      ) : saved ? (
+        <div className="relative">
+          <div className="collab-note-md-full leading-[1.55] text-content-muted"
+            style={{ ...fs(12.5, 'body'), wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
+            <Markdown remarkPlugins={[remarkGfm, remarkBreaks]} components={markdownLinkComponents}>{saved}</Markdown>
+          </div>
+          {canEdit && (
+            <Tooltip label={t('common.edit')}>
+              <button type="button" onClick={start} aria-label={t('common.edit')}
+                className="absolute end-0 top-0 grid h-7 w-7 place-items-center rounded-full bg-surface-card text-content-muted shadow-sm hover:text-content">
+                <Pencil size={13} strokeWidth={2} />
+              </button>
+            </Tooltip>
+          )}
+        </div>
+      ) : (
+        <AddRowButton onClick={start}>{t('day.dailyNote')}</AddRowButton>
+      )}
+    </DialogSection>
   )
 }
 

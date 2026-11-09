@@ -24,5 +24,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Bestätigung',
   'day.editAccommodation': 'Unterkunft bearbeiten',
   'day.reservations': 'Reservierungen',
+  'day.dailyNote': 'Tagesnotiz',
 };
 export default day;

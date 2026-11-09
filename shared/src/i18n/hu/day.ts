@@ -23,5 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Visszaigazolás',
   'day.editAccommodation': 'Szállás szerkesztése',
   'day.reservations': 'Foglalások',
+  'day.dailyNote': 'Napi jegyzet',
 };
 export default day;

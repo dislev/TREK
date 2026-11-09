@@ -23,5 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Підтвердження',
   'day.editAccommodation': 'Редагувати проживання',
   'day.reservations': 'Бронювання',
+  'day.dailyNote': 'Нотатка дня',
 };
 export default day;

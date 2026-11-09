@@ -23,5 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Confirmation', // same-as-en
   'day.editAccommodation': "Modifier l'hébergement",
   'day.reservations': 'Réservations',
+  'day.dailyNote': 'Note du jour',
 };
 export default day;
