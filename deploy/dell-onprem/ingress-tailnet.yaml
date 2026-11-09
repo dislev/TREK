@@ -1,0 +1,16 @@
+# Same pattern as greenhouse-local/grafana-tailnet. Gives https://trek.tail3f6a05.ts.net
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trek-tailnet
+  namespace: trek
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: trek
+      port:
+        number: 3000
+  tls:
+    - hosts:
+        - trek

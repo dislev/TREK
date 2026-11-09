@@ -1,0 +1,39 @@
+# TREK on dell-onprem (microk8s), namespace "trek". Kept apart from greenhouse-local.
+image:
+  repository: trek-app          # imported with `microk8s ctr image import`, never pulled
+  tag: "5.1.1-daysummary"
+  pullPolicy: Never
+
+# The key already used by your data/ directory, kept in a Secret that the runbook
+# creates from data/.encryption_key. A freshly generated key would not decrypt your DB.
+existingSecret: trek-secrets
+existingSecretKey: ENCRYPTION_KEY
+generateEncryptionKey: false
+
+service:
+  type: ClusterIP               # no LoadBalancer: MetalLB's pool (.240-.245) is full
+
+env:
+  NODE_ENV: production
+  PORT: 3000
+  TZ: "America/Los_Angeles"
+  APP_URL: "https://trek.tail3f6a05.ts.net"
+  ALLOWED_ORIGINS: "https://trek.tail3f6a05.ts.net"
+  FORCE_HTTPS: "true"           # TLS ends at the Tailscale ingress proxy
+  TRUST_PROXY: "1"
+
+persistence:
+  enabled: true
+  data:
+    size: 2Gi
+  uploads:
+    size: 5Gi
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits:   { cpu: 500m, memory: 768Mi }
+
+# The chart's ingress always emits a host rule; the Tailscale operator takes its name from
+# tls.hosts instead, so ingress-tailnet.yaml (same shape as greenhouse's grafana-tailnet) is used.
+ingress:
+  enabled: false
