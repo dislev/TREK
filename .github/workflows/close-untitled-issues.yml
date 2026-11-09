@@ -9,10 +9,12 @@ permissions:
 
 jobs:
   check-title:
-    runs-on: ubuntu-latest
+    if: github.repository == 'liketrek/TREK'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Flag or redirect issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = context.payload.issue.title.trim();
@@ -76,7 +78,7 @@ jobs:
                 body: [
                   '## Wrong place for feature requests',
                   '',
-                  'Feature requests should be submitted in [Discussions](https://github.com/mauriceboe/TREK/discussions/new?category=feature-requests), not as issues.',
+                  'Feature requests should be submitted in [Discussions](https://github.com/liketrek/TREK/discussions/new?category=feature-requests), not as issues.',
                   '',
                   'This issue has been closed. Feel free to re-submit your idea in the right place!',
                 ].join('\n'),

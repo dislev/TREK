@@ -1,196 +1,236 @@
-import React, { useState, useEffect } from 'react'
-import { Lock } from 'lucide-react'
+import React from 'react'
+import { Link } from 'react-router'
+import { Bell, Lock, Plug, Send, Webhook } from 'lucide-react'
+import { WEB_PUSH_CHANNEL_ID } from '@trek/shared'
 import { useTranslation } from '../../i18n'
-import { notificationsApi, settingsApi } from '../../api/client'
-import { useToast } from '../shared/Toast'
 import ToggleSwitch from './ToggleSwitch'
 import Section from './Section'
-
-interface PreferencesMatrix {
-  preferences: Record<string, Record<string, boolean>>
-  available_channels: { email: boolean; webhook: boolean; inapp: boolean }
-  event_types: string[]
-  implemented_combos: Record<string, string[]>
-}
-
-const CHANNEL_LABEL_KEYS: Record<string, string> = {
-  email: 'settings.notificationPreferences.email',
-  webhook: 'settings.notificationPreferences.webhook',
-  inapp: 'settings.notificationPreferences.inapp',
-}
-
-const EVENT_LABEL_KEYS: Record<string, string> = {
-  trip_invite: 'settings.notifyTripInvite',
-  booking_change: 'settings.notifyBookingChange',
-  trip_reminder: 'settings.notifyTripReminder',
-  vacay_invite: 'settings.notifyVacayInvite',
-  photos_shared: 'settings.notifyPhotosShared',
-  collab_message: 'settings.notifyCollabMessage',
-  packing_tagged: 'settings.notifyPackingTagged',
-  version_available: 'settings.notifyVersionAvailable',
-}
+import WebPushCard from './WebPushCard'
+import { EVENT_LABEL_KEYS, channelLabel, isLockedCell } from './notificationLabels'
+import { useNotificationSettings } from './useNotificationSettings'
+import { Tooltip } from '../shared/Tooltip'
+import { fs } from '../shared/DialogShell'
+import { EditorField, GRID_2, INPUT } from '../shared/dialogParts'
+import { SettingsCard, SettingsHint, StatusPill, SETTINGS_BUTTON, SETTINGS_BUTTON_DANGER, SETTINGS_BUTTON_PRIMARY } from './settingsKit'
 
 export default function NotificationsTab(): React.ReactElement {
   const { t } = useTranslation()
-  const toast = useToast()
-  const [matrix, setMatrix] = useState<PreferencesMatrix | null>(null)
-  const [saving, setSaving] = useState(false)
-  const [webhookUrl, setWebhookUrl] = useState('')
-  const [webhookIsSet, setWebhookIsSet] = useState(false)
-  const [webhookSaving, setWebhookSaving] = useState(false)
-  const [webhookTesting, setWebhookTesting] = useState(false)
+  const {
+    matrix, loadFailed, saving, visibleChannels, hasChannel, pluginChannels, toggle, testChannel, channelTesting,
+    webhookUrl, setWebhookUrl, webhookIsSet, webhookSaving, webhookTesting, saveWebhookUrl, testWebhookUrl,
+    ntfyTopic, setNtfyTopic, ntfyServer, setNtfyServer, ntfyToken, setNtfyToken, ntfyTokenIsSet,
+    ntfySaving, ntfyTesting, saveNtfySettings, clearNtfyToken, testNtfySettings,
+  } = useNotificationSettings()
 
-  useEffect(() => {
-    notificationsApi.getPreferences().then((data: PreferencesMatrix) => setMatrix(data)).catch(() => {})
-    settingsApi.get().then((data: { settings: Record<string, unknown> }) => {
-      const val = (data.settings?.webhook_url as string) || ''
-      if (val === '••••••••') {
-        setWebhookIsSet(true)
-        setWebhookUrl('')
-      } else {
-        setWebhookUrl(val)
-      }
-    }).catch(() => {})
-  }, [])
-
-  const visibleChannels = matrix
-    ? (['email', 'webhook', 'inapp'] as const).filter(ch => {
-        if (!matrix.available_channels[ch]) return false
-        return matrix.event_types.some(evt => matrix.implemented_combos[evt]?.includes(ch))
-      })
-    : []
-
-  const toggle = async (eventType: string, channel: string) => {
-    if (!matrix) return
-    const current = matrix.preferences[eventType]?.[channel] ?? true
-    const updated = {
-      ...matrix.preferences,
-      [eventType]: { ...matrix.preferences[eventType], [channel]: !current },
-    }
-    setMatrix(m => m ? { ...m, preferences: updated } : m)
-    setSaving(true)
-    try {
-      await notificationsApi.updatePreferences(updated)
-    } catch {
-      setMatrix(m => m ? { ...m, preferences: matrix.preferences } : m)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const saveWebhookUrl = async () => {
-    setWebhookSaving(true)
-    try {
-      await settingsApi.set('webhook_url', webhookUrl)
-      if (webhookUrl) setWebhookIsSet(true)
-      else setWebhookIsSet(false)
-      toast.success(t('settings.webhookUrl.saved'))
-    } catch {
-      toast.error(t('common.error'))
-    } finally {
-      setWebhookSaving(false)
-    }
-  }
-
-  const testWebhookUrl = async () => {
-    if (!webhookUrl && !webhookIsSet) return
-    setWebhookTesting(true)
-    try {
-      const result = await notificationsApi.testWebhook(webhookUrl || undefined)
-      if (result.success) toast.success(t('settings.webhookUrl.testSuccess'))
-      else toast.error(result.error || t('settings.webhookUrl.testFailed'))
-    } catch {
-      toast.error(t('settings.webhookUrl.testFailed'))
-    } finally {
-      setWebhookTesting(false)
-    }
-  }
-
-  const renderContent = () => {
-    if (!matrix) return <p style={{ fontSize: 12, color: 'var(--text-faint)', fontStyle: 'italic' }}>Loading…</p>
+  const renderMatrix = () => {
+    if (!matrix) return loadFailed ? <SettingsHint>{t('common.error')}</SettingsHint> : <MatrixSkeleton label={t('common.loading')} />
 
     if (visibleChannels.length === 0) {
-      return (
-        <p style={{ fontSize: 12, color: 'var(--text-faint)', fontStyle: 'italic' }}>
-          {t('settings.notificationPreferences.noChannels')}
-        </p>
-      )
+      return <SettingsHint>{t('settings.notificationPreferences.noChannels')}</SettingsHint>
     }
 
+    // The event column takes what is left; every channel gets the same narrow
+    // column, so the switches line up under their headers.
+    const columns = `minmax(0, 1fr) ${visibleChannels.map(() => '72px').join(' ')}`
+
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-        {saving && <p style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>Saving…</p>}
-        {matrix.available_channels.webhook && (
-          <div style={{ marginBottom: 16, padding: '12px', background: 'var(--bg-secondary)', borderRadius: 8, border: '1px solid var(--border-primary)' }}>
-            <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 4 }}>
-              {t('settings.webhookUrl.label')}
-            </label>
-            <p style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>{t('settings.webhookUrl.hint')}</p>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <input
-                type="text"
-                value={webhookUrl}
-                onChange={e => setWebhookUrl(e.target.value)}
-                placeholder={webhookIsSet ? '••••••••' : t('settings.webhookUrl.placeholder')}
-                style={{ flex: 1, fontSize: 13, padding: '6px 10px', border: '1px solid var(--border-primary)', borderRadius: 6, background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
-              />
-              <button
-                onClick={saveWebhookUrl}
-                disabled={webhookSaving}
-                style={{ fontSize: 12, padding: '6px 12px', background: 'var(--text-primary)', color: 'var(--bg-primary)', border: 'none', borderRadius: 6, cursor: webhookSaving ? 'not-allowed' : 'pointer', opacity: webhookSaving ? 0.6 : 1 }}
-              >
-                {t('settings.webhookUrl.save')}
-              </button>
-              <button
-                onClick={testWebhookUrl}
-                disabled={(!webhookUrl && !webhookIsSet) || webhookTesting}
-                style={{ fontSize: 12, padding: '6px 12px', background: 'transparent', color: 'var(--text-secondary)', border: '1px solid var(--border-primary)', borderRadius: 6, cursor: ((!webhookUrl && !webhookIsSet) || webhookTesting) ? 'not-allowed' : 'pointer', opacity: ((!webhookUrl && !webhookIsSet) || webhookTesting) ? 0.5 : 1 }}
-              >
-                {t('settings.webhookUrl.test')}
-              </button>
-            </div>
+      <div className="overflow-x-auto rounded-[12px] border border-edge-faint bg-surface-card">
+        <div className="min-w-fit divide-y divide-edge-faint">
+          {/* Header row */}
+          <div className="grid items-center gap-1 bg-surface-secondary px-3.5 py-2.5" style={{ gridTemplateColumns: columns }}>
+            <span />
+            {visibleChannels.map(ch => (
+              <Tooltip key={ch.id} label={t('settings.notificationPreferences.notConfigured')} disabled={ch.configured}>
+                <span
+                  className={`line-clamp-2 break-words text-center font-geist font-bold uppercase leading-tight tracking-[.08em] ${ch.configured ? 'text-content-faint' : 'text-warning'}`}
+                  style={fs(10)}
+                >
+                  {channelLabel(ch, t)}
+                </span>
+              </Tooltip>
+            ))}
           </div>
-        )}
-        {/* Header row */}
-        <div style={{ display: 'grid', gridTemplateColumns: `1fr ${visibleChannels.map(() => '64px').join(' ')}`, gap: 4, paddingBottom: 6, marginBottom: 4, borderBottom: '1px solid var(--border-primary)' }}>
-          <span />
-          {visibleChannels.map(ch => (
-            <span key={ch} style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-faint)', textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-              {t(CHANNEL_LABEL_KEYS[ch]) || ch}
-            </span>
-          ))}
+          {/* Event rows */}
+          {matrix.event_types.map(eventType => {
+            const implementedForEvent = matrix.implemented_combos[eventType] ?? []
+            const relevantChannels = visibleChannels.filter(ch => implementedForEvent.includes(ch.id))
+            if (relevantChannels.length === 0) return null
+            return (
+              <div key={eventType} className="grid items-center gap-1 px-3.5 py-3" style={{ gridTemplateColumns: columns }}>
+                <span className="min-w-0 pe-2 font-medium text-content" style={fs(13, 'body')}>
+                  {t(EVENT_LABEL_KEYS[eventType]) || eventType}
+                </span>
+                {visibleChannels.map(ch => {
+                  if (!implementedForEvent.includes(ch.id)) {
+                    return <span key={ch.id} className="text-center text-content-faint" style={fs(13, 'body')}>—</span>
+                  }
+                  const isOn = matrix.preferences[eventType]?.[ch.id] ?? true
+                  // Switched off for everyone by the admin (#1536): the same footprint as
+                  // the switch, so the grid keeps its columns, and a lock that says why.
+                  if (isLockedCell(matrix.locked, eventType, ch.id)) {
+                    return (
+                      <div key={ch.id} className="flex justify-center">
+                        <Tooltip label={t('settings.notificationPreferences.lockedByAdmin')}>
+                          <span role="img" aria-label={t('settings.notificationPreferences.lockedByAdmin')} data-locked
+                            className="inline-flex h-6 w-11 items-center justify-center rounded-full bg-surface-tertiary text-content-faint">
+                            <Lock size={12} />
+                          </span>
+                        </Tooltip>
+                      </div>
+                    )
+                  }
+                  return (
+                    <div key={ch.id} className="flex justify-center">
+                      <ToggleSwitch on={isOn} onToggle={() => toggle(eventType, ch.id)} />
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          })}
         </div>
-        {/* Event rows */}
-        {matrix.event_types.map(eventType => {
-          const implementedForEvent = matrix.implemented_combos[eventType] ?? []
-          const relevantChannels = visibleChannels.filter(ch => implementedForEvent.includes(ch))
-          if (relevantChannels.length === 0) return null
-          return (
-            <div key={eventType} style={{ display: 'grid', gridTemplateColumns: `1fr ${visibleChannels.map(() => '64px').join(' ')}`, gap: 4, alignItems: 'center', padding: '6px 0', borderBottom: '1px solid var(--border-primary)' }}>
-              <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>
-                {t(EVENT_LABEL_KEYS[eventType]) || eventType}
-              </span>
-              {visibleChannels.map(ch => {
-                if (!implementedForEvent.includes(ch)) {
-                  return <span key={ch} style={{ textAlign: 'center', color: 'var(--text-faint)', fontSize: 14 }}>—</span>
-                }
-                const isOn = matrix.preferences[eventType]?.[ch] ?? true
-                return (
-                  <div key={ch} style={{ display: 'flex', justifyContent: 'center' }}>
-                    <ToggleSwitch on={isOn} onToggle={() => toggle(eventType, ch)} />
-                  </div>
-                )
-              })}
-            </div>
-          )
-        })}
       </div>
     )
   }
 
+  const webhookTestDisabled = (!webhookUrl && !webhookIsSet) || webhookTesting
+  // The channel cards only make sense once there is a matrix to send through.
+  const ready = !!matrix && visibleChannels.length > 0
+
   return (
-    <Section title={t('settings.notifications')} icon={Lock}>
-      {renderContent()}
-    </Section>
+    <div>
+      <Section
+        title={t('settings.notifications')}
+        icon={Bell}
+        badge={saving ? <StatusPill>{t('common.saving')}</StatusPill> : undefined}
+      >
+        {renderMatrix()}
+      </Section>
+
+      {ready && hasChannel('webhook') && (
+        <SettingsCard icon={Webhook} title={t('settings.webhookUrl.label')} hint={t('settings.webhookUrl.hint')}>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              id="notifications-webhook-url"
+              type="text"
+              value={webhookUrl}
+              onChange={e => setWebhookUrl(e.target.value)}
+              placeholder={webhookIsSet ? '••••••••' : t('settings.webhookUrl.placeholder')}
+              aria-label={t('settings.webhookUrl.label')}
+              className={`${INPUT} min-w-[220px] flex-1`}
+            />
+            <button type="button" onClick={testWebhookUrl} disabled={webhookTestDisabled} className={SETTINGS_BUTTON} style={fs(13, 'body')}>
+              {t('settings.webhookUrl.test')}
+            </button>
+            <button type="button" onClick={saveWebhookUrl} disabled={webhookSaving} className={SETTINGS_BUTTON_PRIMARY} style={fs(13, 'body')}>
+              {t('common.save')}
+            </button>
+          </div>
+        </SettingsCard>
+      )}
+
+      {ready && hasChannel('ntfy') && (
+        <SettingsCard icon={Send} title={t('settings.notificationPreferences.ntfy')} hint={t('settings.ntfyUrl.hint')}>
+          <div className={GRID_2}>
+            <EditorField label={t('settings.ntfyUrl.topicLabel')} htmlFor="notifications-ntfy-topic">
+              <input
+                id="notifications-ntfy-topic"
+                type="text"
+                value={ntfyTopic}
+                onChange={e => setNtfyTopic(e.target.value)}
+                placeholder={t('settings.ntfyUrl.topicPlaceholder')}
+                className={INPUT}
+              />
+            </EditorField>
+            <EditorField label={t('settings.ntfyUrl.serverLabel')} htmlFor="notifications-ntfy-server">
+              <input
+                id="notifications-ntfy-server"
+                type="text"
+                value={ntfyServer}
+                onChange={e => setNtfyServer(e.target.value)}
+                placeholder={matrix?.defaults?.ntfyServer || t('settings.ntfyUrl.serverPlaceholder')}
+                className={INPUT}
+              />
+            </EditorField>
+          </div>
+          <EditorField label={t('settings.ntfyUrl.tokenLabel')} htmlFor="notifications-ntfy-token" hint={t('settings.ntfyUrl.tokenHint')}>
+            <div className="flex items-center gap-2">
+              <input
+                id="notifications-ntfy-token"
+                type="password"
+                value={ntfyToken}
+                onChange={e => setNtfyToken(e.target.value)}
+                placeholder={ntfyTokenIsSet ? '••••••••' : ''}
+                className={`${INPUT} flex-1`}
+              />
+              {ntfyTokenIsSet && (
+                <button type="button" onClick={clearNtfyToken} className={SETTINGS_BUTTON_DANGER} style={fs(13, 'body')}>
+                  {t('common.clear')}
+                </button>
+              )}
+            </div>
+          </EditorField>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <button type="button" onClick={testNtfySettings} disabled={!ntfyTopic || ntfyTesting} className={SETTINGS_BUTTON} style={fs(13, 'body')}>
+              {t('settings.ntfyUrl.test')}
+            </button>
+            <button type="button" onClick={saveNtfySettings} disabled={ntfySaving} className={SETTINGS_BUTTON_PRIMARY} style={fs(13, 'body')}>
+              {t('common.save')}
+            </button>
+          </div>
+        </SettingsCard>
+      )}
+
+      {/* Per device rather than per account: the matrix above picks the events,
+          this card decides whether this browser is one of the places they go. */}
+      {ready && hasChannel(WEB_PUSH_CHANNEL_ID) && <WebPushCard />}
+
+      {ready && pluginChannels.map(ch => (
+        <SettingsCard
+          key={ch.id}
+          icon={Plug}
+          title={channelLabel(ch, t)}
+          hint={ch.configured
+            ? t('settings.notificationPreferences.pluginConfigured')
+            : t('settings.notificationPreferences.notConfigured')}
+          action={
+            <>
+              {/* Unconfigured is the common case on first use — send them to where the
+                  credentials actually live rather than just naming the place. */}
+              {!ch.configured && ch.settingsPath && (
+                <Link to={ch.settingsPath} className={`${SETTINGS_BUTTON_PRIMARY} no-underline`} style={fs(13, 'body')}>
+                  {t('settings.notificationPreferences.configure')}
+                </Link>
+              )}
+              <button type="button"
+                onClick={() => testChannel(ch)}
+                disabled={!ch.configured || channelTesting === ch.id}
+                className={SETTINGS_BUTTON}
+                style={fs(13, 'body')}
+              >
+                {t('settings.notificationPreferences.sendTest')}
+              </button>
+            </>
+          }
+        />
+      ))}
+    </div>
+  )
+}
+
+/** A calm placeholder for the matrix while the preferences load. */
+function MatrixSkeleton({ label }: { label: string }) {
+  return (
+    <div className="flex flex-col gap-2" aria-busy="true">
+      <SettingsHint>{label}</SettingsHint>
+      <div className="divide-y divide-edge-faint overflow-hidden rounded-[12px] border border-edge-faint bg-surface-card">
+        {[0, 1, 2].map(i => (
+          <div key={i} className="flex items-center gap-4 px-3.5 py-3">
+            <span className="h-3 flex-1 animate-pulse rounded-full bg-surface-tertiary" />
+            <span className="h-6 w-11 animate-pulse rounded-full bg-surface-tertiary" />
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }

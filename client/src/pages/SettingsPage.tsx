@@ -1,93 +1,98 @@
-import React, { useState, useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
-import { Settings } from 'lucide-react'
+import React from 'react'
+import { Settings, SlidersHorizontal, Paintbrush, Map, Bell, Plug, CloudOff, User, Info, Blocks } from 'lucide-react'
 import { useTranslation } from '../i18n'
-import { authApi } from '../api/client'
-import { useAddonStore } from '../store/addonStore'
-import Navbar from '../components/Layout/Navbar'
+import PageShell from '../components/Layout/PageShell'
+import PageSidebar, { type PageSidebarTab } from '../components/Layout/PageSidebar'
+import { SettingsHeader } from '../components/Settings/settingsKit'
 import DisplaySettingsTab from '../components/Settings/DisplaySettingsTab'
+import AppearanceSettingsTab from '../components/Settings/AppearanceSettingsTab'
 import MapSettingsTab from '../components/Settings/MapSettingsTab'
 import NotificationsTab from '../components/Settings/NotificationsTab'
 import IntegrationsTab from '../components/Settings/IntegrationsTab'
 import AccountTab from '../components/Settings/AccountTab'
 import AboutTab from '../components/Settings/AboutTab'
+import HelpAnchor from '../components/Help/HelpAnchor'
+import { getHelpContext } from '../help/registry'
+import OfflineTab from '../components/Settings/OfflineTab'
+import PluginSettingsTab from '../components/Settings/PluginSettingsTab'
+import { useSettings } from './settings/useSettings'
 
 export default function SettingsPage(): React.ReactElement {
+  // ViewportRoute in App.tsx picks the branch now, so the phone screen is a
+  // chunk of its own instead of a dead limb in this one.
+  return <SettingsPageDesktop />
+}
+
+function SettingsPageDesktop(): React.ReactElement {
   const { t } = useTranslation()
-  const [searchParams] = useSearchParams()
-  const { isEnabled: addonEnabled, loadAddons } = useAddonStore()
+  // Page = wiring container: addon/version loading + active-tab state in the hook.
+  const { hasPlugins, appVersion, activeTab, setActiveTab, managed } = useSettings()
+  // Every tab is its own help screen; a tab without one falls back to the settings overview.
+  const helpId = getHelpContext(`settings-${activeTab}`) ? `settings-${activeTab}` : 'settings'
 
-  const memoriesEnabled = addonEnabled('memories')
-  const mcpEnabled = addonEnabled('mcp')
-  const hasIntegrations = memoriesEnabled || mcpEnabled
-
-  const [appVersion, setAppVersion] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState('display')
-
-  useEffect(() => {
-    loadAddons()
-    authApi.getAppConfig?.().then(c => setAppVersion(c?.version)).catch(() => {})
-  }, [])
-
-  // Auto-switch to account tab when MFA is required
-  useEffect(() => {
-    if (searchParams.get('mfa') === 'required') {
-      setActiveTab('account')
-    }
-  }, [searchParams])
-
-  const TABS = [
-    { id: 'display', label: t('settings.tabs.display') },
-    { id: 'map', label: t('settings.tabs.map') },
-    { id: 'notifications', label: t('settings.tabs.notifications') },
-    ...(hasIntegrations ? [{ id: 'integrations', label: t('settings.tabs.integrations') }] : []),
-    { id: 'account', label: t('settings.tabs.account') },
-    ...(appVersion ? [{ id: 'about', label: t('settings.tabs.about') }] : []),
+  const tabs: PageSidebarTab[] = [
+    { id: 'display', label: t('settings.tabs.display'), icon: SlidersHorizontal },
+    { id: 'appearance', label: t('settings.tabs.appearance'), icon: Paintbrush },
+    { id: 'map', label: t('settings.tabs.map'), icon: Map },
+    { id: 'notifications', label: t('settings.tabs.notifications'), icon: Bell },
+    // Always there: API keys sit in this tab and need no addon. The addon backed
+    // sections inside it gate themselves.
+    { id: 'integrations', label: t('settings.tabs.integrations'), icon: Plug },
+    ...(hasPlugins && !managed
+      ? [{ id: 'plugins', label: t('settings.tabs.plugins'), icon: Blocks }]
+      : []),
+    { id: 'offline', label: t('settings.tabs.offline'), icon: CloudOff },
+    { id: 'account', label: t('settings.tabs.account'), icon: User },
+    // About is where the project lives: what TREK is, where to report a bug,
+    // where to support it. A customer of a hosted instance is the audience for
+    // none of that, so the tab goes and the sidebar footer below carries the one
+    // thing that has to stay — the link to the source (AGPL §13).
+    ...(appVersion && !managed
+      ? [{ id: 'about', label: t('settings.tabs.about'), icon: Info }]
+      : []),
   ]
 
   return (
-    <div className="min-h-screen" style={{ background: 'var(--bg-secondary)' }}>
-      <Navbar />
-
-      <div style={{ paddingTop: 'var(--nav-h)' }}>
-        <div className="max-w-6xl mx-auto px-4 py-8">
+    <PageShell background="var(--bg-primary)">
+      <div className="w-full px-4 sm:px-6 lg:px-8 py-6">
           {/* Header */}
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--bg-tertiary)' }}>
-              <Settings className="w-5 h-5" style={{ color: 'var(--text-secondary)' }} />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>{t('settings.title')}</h1>
-              <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{t('settings.subtitle')}</p>
-            </div>
-          </div>
+          <HelpAnchor id={helpId} />
+          <SettingsHeader icon={Settings} title={t('settings.title')} subtitle={t('settings.subtitle')} />
 
-          {/* Tab bar */}
-          <div className="grid grid-cols-3 sm:flex gap-1 mb-6 rounded-xl p-1" style={{ background: 'var(--bg-card)', border: '1px solid var(--border-primary)' }}>
-            {TABS.map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`px-3 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg transition-colors ${
-                  activeTab === tab.id
-                    ? 'bg-slate-900 text-white'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Tab content */}
-          {activeTab === 'display' && <DisplaySettingsTab />}
-          {activeTab === 'map' && <MapSettingsTab />}
-          {activeTab === 'notifications' && <NotificationsTab />}
-          {activeTab === 'integrations' && hasIntegrations && <IntegrationsTab />}
-          {activeTab === 'account' && <AccountTab />}
-          {activeTab === 'about' && appVersion && <AboutTab appVersion={appVersion} />}
+          {/* Sidebar layout */}
+          <PageSidebar
+            sidebarLabel={t('settings.title').toUpperCase()}
+            tabs={tabs}
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            footer={
+              appVersion
+                ? managed
+                  // No About tab here, so this is the prominent source offer
+                  // AGPL §13 asks for when people use it over a network.
+                  ? <a
+                      href="https://github.com/liketrek/TREK"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="no-underline text-content-faint hover:text-content-secondary"
+                    >
+                      v{appVersion}
+                    </a>
+                  : `v${appVersion}`
+                : ''
+            }
+          >
+            {activeTab === 'display' && <DisplaySettingsTab />}
+            {activeTab === 'appearance' && <AppearanceSettingsTab />}
+            {activeTab === 'map' && <MapSettingsTab />}
+            {activeTab === 'notifications' && <NotificationsTab />}
+            {activeTab === 'integrations' && <IntegrationsTab />}
+            {activeTab === 'plugins' && hasPlugins && !managed && <PluginSettingsTab />}
+            {activeTab === 'offline' && <OfflineTab />}
+            {activeTab === 'account' && <AccountTab />}
+            {activeTab === 'about' && appVersion && <AboutTab appVersion={appVersion} />}
+          </PageSidebar>
         </div>
-      </div>
-    </div>
+    </PageShell>
   )
 }

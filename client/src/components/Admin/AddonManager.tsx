@@ -1,325 +1,365 @@
-import { useEffect, useState } from 'react'
-import { adminApi } from '../../api/client'
+import { useState, type ComponentType } from 'react'
 import { useTranslation } from '../../i18n'
-import { useSettingsStore } from '../../store/settingsStore'
-import { useAddonStore } from '../../store/addonStore'
-import { useToast } from '../shared/Toast'
-import { Puzzle, ListChecks, Wallet, FileText, CalendarDays, Globe, Briefcase, Image, Terminal, Link2 } from 'lucide-react'
+import { useIsDark } from '../../hooks/useIsDark'
+import { Puzzle, ListChecks, Wallet, FileText, CalendarDays, Globe, Briefcase, Image, Terminal, Link2, Compass, BookOpen, Sparkles, Luggage, Plane, Bookmark, Users, Loader2, Mountain, CarFront, Search } from 'lucide-react'
+import EmptyState from '../shared/EmptyState'
+import DawarichIcon from '../shared/DawarichIcon'
+import AirTrailIcon from '../shared/AirTrailIcon'
+import { DOCUMENT_PROVIDER_ICONS } from '../shared/documentProviderIconMap'
+import AddonTile from './AddonTile'
+import AddonSubRow from './AddonSubRow'
+import { Tooltip } from '../shared/Tooltip'
+import { fs } from '../shared/DialogShell'
+import { SettingsCard, StatusPill } from '../Settings/settingsKit'
+import { type Addon, type CollabFeatures, COLLAB_SUB_FEATURES, getAddonLabel } from './addons/addonModel'
+import { useAddonManager } from './addons/useAddonManager'
+import AiAddonTile from './addons/AiAddonTile'
+import { ImmichIcon, SynologyIcon } from './addons/PhotoProviderIcons'
+import WandererMark from '../Tours/wanderer/WandererMark'
 
+// Keys are the `icon` column from the addons table (see server seeds.ts); anything
+// unknown falls back to Puzzle. Users/Sparkles cover collab and llm_parsing, which
+// used to land on the fallback.
 const ICON_MAP = {
-  ListChecks, Wallet, FileText, CalendarDays, Puzzle, Globe, Briefcase, Image, Terminal, Link2,
+  ListChecks, Wallet, FileText, CalendarDays, Puzzle, Globe, Briefcase, Image, Terminal, Link2, Compass, BookOpen, Plane, Bookmark, Users, Sparkles,
+  Mountain,
+  // Road trip was seeded as 'Route'; the car says what it is better than a line does.
+  Route: CarFront,
+  // Dawarich ships a brand mark rather than a lucide name, the same way the photo
+  // providers below do. Keyed by the string in the addons table.
+  Dawarich: DawarichIcon,
 }
 
-interface Addon {
-  id: string
-  name: string
-  description: string
-  icon: string
-  type: string
-  enabled: boolean
-  config?: Record<string, unknown>
-}
-
-interface ProviderOption {
-  key: string
-  label: string
-  description: string
-  enabled: boolean
-  toggle: () => Promise<void>
+const PROVIDER_ICONS: Record<string, ComponentType<{ size?: number }>> = {
+  immich: ImmichIcon,
+  synologyphotos: SynologyIcon,
+  // The document providers' own marks, single-colour so they read as glyphs in
+  // a row of lucide icons and invert with the theme.
+  ...DOCUMENT_PROVIDER_ICONS,
 }
 
 interface AddonIconProps {
   name: string
   size?: number
+  /** A switched-off addon greys its icon out, brand marks included. */
+  enabled?: boolean
 }
 
-function AddonIcon({ name, size = 20 }: AddonIconProps) {
+function AddonIcon({ name, size = 20, enabled = true }: AddonIconProps) {
+  // The brand marks are badges, not glyphs: they fill the framed slot instead of
+  // sitting in the middle of it at glyph size, and they grey out when the addon
+  // is off — the lucide glyphs get that from the slot's text colour, an <img>
+  // has to be told.
+  if (name === 'Dawarich') return <DawarichIcon fill muted={!enabled} />
+  // 'Plane' is the icon string airtrail was seeded with, and INSERT OR IGNORE
+  // means every existing install still carries it — so the brand is keyed on
+  // that rather than on a new name no row would ever have.
+  if (name === 'Plane') return <AirTrailIcon fill muted={!enabled} />
   const Icon = ICON_MAP[name] || Puzzle
   return <Icon size={size} />
 }
 
-export default function AddonManager({ bagTrackingEnabled, onToggleBagTracking }: { bagTrackingEnabled?: boolean; onToggleBagTracking?: () => void }) {
+/** What each type means, shown on the tile itself now that the sections are gone. The
+ *  hint rides along as the tooltip, so "Global" still explains itself. */
+const TYPE_META: Record<string, { icon: ComponentType<{ size?: number }>; labelKey: string; hintKey: string }> = {
+  trip: { icon: Briefcase, labelKey: 'admin.addons.type.trip', hintKey: 'admin.addons.tripHint' },
+  global: { icon: Globe, labelKey: 'admin.addons.type.global', hintKey: 'admin.addons.globalHint' },
+  integration: { icon: Link2, labelKey: 'admin.addons.type.integration', hintKey: 'admin.addons.integrationHint' },
+}
+
+export default function AddonManager({ bagTrackingEnabled, onToggleBagTracking, collabFeatures, onToggleCollabFeature }: { bagTrackingEnabled?: boolean; onToggleBagTracking?: () => void; collabFeatures?: CollabFeatures; onToggleCollabFeature?: (key: string) => void }) {
   const { t } = useTranslation()
-  const dm = useSettingsStore(s => s.settings.dark_mode)
-  const dark = dm === true || dm === 'dark' || (dm === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-  const toast = useToast()
-  const refreshGlobalAddons = useAddonStore(s => s.loadAddons)
-  const [addons, setAddons] = useState<Addon[]>([])
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    loadAddons()
-  }, [])
-
-  const loadAddons = async () => {
-    setLoading(true)
-    try {
-      const data = await adminApi.addons()
-      setAddons(data.addons)
-    } catch (err: unknown) {
-      toast.error(t('admin.addons.toast.error'))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleToggle = async (addon: Addon) => {
-    const newEnabled = !addon.enabled
-    // Optimistic update
-    setAddons(prev => prev.map(a => a.id === addon.id ? { ...a, enabled: newEnabled } : a))
-    try {
-      await adminApi.updateAddon(addon.id, { enabled: newEnabled })
-      refreshGlobalAddons()
-      toast.success(t('admin.addons.toast.updated'))
-    } catch (err: unknown) {
-      // Rollback
-      setAddons(prev => prev.map(a => a.id === addon.id ? { ...a, enabled: !newEnabled } : a))
-      toast.error(t('admin.addons.toast.error'))
-    }
-  }
-
-  const isPhotoProviderAddon = (addon: Addon) => {
-    return addon.type === 'photo_provider'
-  }
-
-  const isPhotosAddon = (addon: Addon) => {
-    const haystack = `${addon.id} ${addon.name} ${addon.description}`.toLowerCase()
-    return addon.type === 'trip' && (addon.icon === 'Image' || haystack.includes('photo') || haystack.includes('memories'))
-  }
-
-  const handleTogglePhotoProvider = async (providerAddon: Addon) => {
-    const enableProvider = !providerAddon.enabled
-    const prev = addons
-
-    setAddons(current => current.map(a => a.id === providerAddon.id ? { ...a, enabled: enableProvider } : a))
-
-    try {
-      await adminApi.updateAddon(providerAddon.id, { enabled: enableProvider })
-      refreshGlobalAddons()
-      toast.success(t('admin.addons.toast.updated'))
-    } catch {
-      setAddons(prev)
-      toast.error(t('admin.addons.toast.error'))
-    }
-  }
-
-  const tripAddons = addons.filter(a => a.type === 'trip')
-  const globalAddons = addons.filter(a => a.type === 'global')
-  const photoProviderAddons = addons.filter(isPhotoProviderAddon)
-  const integrationAddons = addons.filter(a => a.type === 'integration')
-  const photosAddon = tripAddons.find(isPhotosAddon)
-  const providerOptions: ProviderOption[] = photoProviderAddons.map((provider) => ({
-      key: provider.id,
-      label: provider.name,
-      description: provider.description,
-      enabled: provider.enabled,
-      toggle: () => handleTogglePhotoProvider(provider),
-    }))
-  const photosDerivedEnabled = providerOptions.some(p => p.enabled)
+  const dark = useIsDark()
+  const {
+    addons, loading, handleToggle, tripAddons, globalAddons, integrationAddons, aiAddons, providerOptions, documentProviderOptions,
+    toursWanderer,
+    wandererOffered,
+    toggleToursWanderer,
+    mapSwitches,
+  } = useAddonManager()
+  const [query, setQuery] = useState('')
+  const [view, setView] = useState<AddonView>('all')
 
   if (loading) {
     return (
-      <div className="p-8 text-center">
-        <div className="w-8 h-8 border-2 border-slate-200 border-t-slate-900 rounded-full animate-spin mx-auto" style={{ borderTopColor: 'var(--text-primary)' }}></div>
-      </div>
+      <SettingsCard icon={Puzzle} title={t('admin.addons.title')}>
+        <div className="grid place-items-center py-14">
+          <Loader2 size={22} className="animate-spin text-content-faint" />
+        </div>
+      </SettingsCard>
     )
   }
 
-  return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="rounded-xl border overflow-hidden" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-primary)' }}>
-        <div className="px-6 py-4 border-b" style={{ borderColor: 'var(--border-secondary)' }}>
-          <h2 className="font-semibold" style={{ color: 'var(--text-primary)' }}>{t('admin.addons.title')}</h2>
-          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
-            {t('admin.addons.subtitleBefore')}<img src={dark ? '/text-light.svg' : '/text-dark.svg'} alt="TREK" style={{ height: 11, display: 'inline', verticalAlign: 'middle', opacity: 0.7 }} />{t('admin.addons.subtitleAfter')}
-          </p>
-        </div>
+  /** Bag tracking, the collab features and the photo providers all hang off their
+   *  parent as shelf rows, and each shelf only shows while its parent is on —
+   *  a provider toggled under a disabled Journey would hit the server's 409. */
+  const shelfFor = (addon: Addon) => {
+    if (addon.id === 'packing' && addon.enabled && onToggleBagTracking) {
+      return (
+        <AddonSubRow
+          icon={<Luggage size={14} />}
+          title={t('admin.bagTracking.title')}
+          description={t('admin.bagTracking.subtitle')}
+          enabled={!!bagTrackingEnabled}
+          onToggle={onToggleBagTracking}
+        />
+      )
+    }
+    if (addon.id === 'collab' && addon.enabled && collabFeatures && onToggleCollabFeature) {
+      return COLLAB_SUB_FEATURES.map(feat => {
+        const Icon = feat.icon
+        return (
+          <AddonSubRow
+            key={feat.key}
+            icon={<Icon size={14} />}
+            title={t(feat.titleKey)}
+            description={t(feat.subtitleKey)}
+            enabled={collabFeatures[feat.key]}
+            onToggle={() => onToggleCollabFeature(feat.key)}
+          />
+        )
+      })
+    }
+    // Document providers are the Documents tile's shelf, the way photo providers
+    // are Journey's. Unlike those they carry no credential form here: a document
+    // connection belongs to a trip, not to a user, so it is entered in the trip's
+    // file manager. The admin decides only whether a provider may be offered.
+    if (addon.id === 'documents' && addon.enabled && documentProviderOptions.length > 0) {
+      return documentProviderOptions.map(provider => {
+        const ProviderIcon = PROVIDER_ICONS[provider.key]
+        return (
+          <AddonSubRow
+            key={provider.key}
+            icon={ProviderIcon ? <ProviderIcon size={14} /> : undefined}
+            title={provider.label}
+            description={provider.description}
+            enabled={provider.enabled}
+            onToggle={provider.toggle}
+          />
+        )
+      })
+    }
+    if (addon.id === 'journey' && addon.enabled && providerOptions.length > 0) {
+      return providerOptions.map(provider => {
+        const ProviderIcon = PROVIDER_ICONS[provider.key]
+        return (
+          <AddonSubRow
+            key={provider.key}
+            icon={ProviderIcon ? <ProviderIcon size={14} /> : undefined}
+            title={provider.label}
+            description={provider.description}
+            enabled={provider.enabled}
+            onToggle={provider.toggle}
+          />
+        )
+      })
+    }
+    // An array, not a fragment: the tile counts its rows to fold them behind the
+    // "N options" bar the way Collab's and Documents' are.
+    if (addon.id === 'tours' && addon.enabled) {
+      return [
+        ...(wandererOffered
+          ? [
+              <AddonSubRow
+                key="wanderer"
+                icon={<WandererMark size={14} />}
+                title={t('admin.toursWanderer.title')}
+                description={t('admin.toursWanderer.subtitle')}
+                enabled={toursWanderer}
+                onToggle={() => void toggleToursWanderer()}
+              />,
+            ]
+          : []),
+        ...mapSwitches.map(({ key, Icon, titleKey, subtitleKey, enabled, toggle }) => (
+          <AddonSubRow
+            key={key}
+            icon={<Icon size={14} />}
+            title={t(titleKey)}
+            description={t(subtitleKey)}
+            enabled={enabled}
+            onToggle={() => void toggle()}
+          />
+        )),
+      ]
+    }
+    return null
+  }
 
-        {addons.length === 0 ? (
-          <div className="p-8 text-center text-sm" style={{ color: 'var(--text-faint)' }}>
-            {t('admin.addons.noAddons')}
-          </div>
-        ) : (
-          <div>
-            {/* Trip Addons */}
-            {tripAddons.length > 0 && (
-              <div>
-                <div className="px-6 py-2.5 border-b flex items-center gap-2" style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-secondary)' }}>
-                  <Briefcase size={13} style={{ color: 'var(--text-muted)' }} />
-                  <span className="text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                    {t('admin.addons.type.trip')} — {t('admin.addons.tripHint')}
-                  </span>
-                </div>
-                {tripAddons.map(addon => (
-                  <div key={addon.id}>
-                    <AddonRow
-                      addon={addon}
-                      onToggle={handleToggle}
-                      t={t}
-                      nameOverride={photosAddon && addon.id === photosAddon.id ? 'Memories providers' : undefined}
-                      descriptionOverride={photosAddon && addon.id === photosAddon.id ? 'Enable or disable each photo provider.' : undefined}
-                      statusOverride={photosAddon && addon.id === photosAddon.id ? photosDerivedEnabled : undefined}
-                      hideToggle={photosAddon && addon.id === photosAddon.id}
-                    />
-                    {photosAddon && addon.id === photosAddon.id && providerOptions.length > 0 && (
-                      <div className="px-6 py-3 border-b" style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-secondary)', paddingLeft: 70 }}>
-                        <div className="space-y-2">
-                          {providerOptions.map(provider => (
-                            <div key={provider.key} className="flex items-center gap-4" style={{ minHeight: 32 }}>
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <div className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>{provider.label}</div>
-                                <div className="text-xs mt-0.5" style={{ color: 'var(--text-faint)' }}>{provider.description}</div>
-                              </div>
-                              <div className="flex items-center gap-2 shrink-0">
-                                <span className="hidden sm:inline text-xs font-medium" style={{ color: provider.enabled ? 'var(--text-primary)' : 'var(--text-faint)' }}>
-                                  {provider.enabled ? t('admin.addons.enabled') : t('admin.addons.disabled')}
-                                </span>
-                                <button
-                                  onClick={provider.toggle}
-                                  className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
-                                  style={{ background: provider.enabled ? 'var(--text-primary)' : 'var(--border-primary)' }}
-                                >
-                                  <span className="absolute left-0.5 h-5 w-5 rounded-full bg-white transition-transform duration-200"
-                                    style={{ transform: provider.enabled ? 'translateX(20px)' : 'translateX(0)' }} />
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {addon.id === 'packing' && addon.enabled && onToggleBagTracking && (
-                      <div className="flex items-center gap-4 px-6 py-3 border-b" style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-secondary)', paddingLeft: 70 }}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>{t('admin.bagTracking.title')}</div>
-                          <div className="text-xs mt-0.5" style={{ color: 'var(--text-faint)' }}>{t('admin.bagTracking.subtitle')}</div>
-                        </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <span className="hidden sm:inline text-xs font-medium" style={{ color: bagTrackingEnabled ? 'var(--text-primary)' : 'var(--text-faint)' }}>
-                            {bagTrackingEnabled ? t('admin.addons.enabled') : t('admin.addons.disabled')}
-                          </span>
-                          <button onClick={onToggleBagTracking}
-                            className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
-                            style={{ background: bagTrackingEnabled ? 'var(--text-primary)' : 'var(--border-primary)' }}>
-                            <span className="absolute left-0.5 h-5 w-5 rounded-full bg-white transition-transform duration-200"
-                              style={{ transform: bagTrackingEnabled ? 'translateX(20px)' : 'translateX(0)' }} />
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
+  const tile = (addon: Addon) => {
+    const label = getAddonLabel(t, addon)
+    return (
+      <AddonTile
+        key={addon.id}
+        icon={<AddonIcon name={addon.icon} size={18} enabled={addon.enabled} />}
+        name={label.name}
+        description={label.description}
+        enabled={addon.enabled}
+        onToggle={() => handleToggle(addon)}
+      >
+        {shelfFor(addon)}
+      </AddonTile>
+    )
+  }
 
-            {/* Global Addons */}
-            {globalAddons.length > 0 && (
-              <div>
-                <div className="px-6 py-2.5 border-b border-t flex items-center gap-2" style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-secondary)' }}>
-                  <Globe size={13} style={{ color: 'var(--text-muted)' }} />
-                  <span className="text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                    {t('admin.addons.type.global')} — {t('admin.addons.globalHint')}
-                  </span>
-                </div>
-                {globalAddons.map(addon => (
-                  <AddonRow key={addon.id} addon={addon} onToggle={handleToggle} t={t} />
-                ))}
-              </div>
-            )}
+  /* A card per type, the way every other admin tab sets its cards: Trip in the
+     left column, Global and Integration in the right one, each card with the
+     dialogs' head band carrying the type, its count and what it means. Above
+     them one card says how many are on and finds an addon by name. */
+  const groups = [
+    { key: 'trip', addons: tripAddons },
+    { key: 'global', addons: globalAddons },
+    { key: 'integration', addons: integrationAddons },
+  ].filter(g => g.addons.length > 0 || (g.key === 'integration' && aiAddons.length > 0))
+  const enabledCount = addons.filter(a => a.type !== 'photo_provider' && a.type !== 'document_provider' && a.enabled).length
+  const totalCount = tripAddons.length + globalAddons.length + integrationAddons.length + aiAddons.length
 
-            {/* Integration Addons */}
-            {integrationAddons.length > 0 && (
-              <div>
-                <div className="px-6 py-2.5 border-b border-t flex items-center gap-2" style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-secondary)' }}>
-                  <Link2 size={13} style={{ color: 'var(--text-muted)' }} />
-                  <span className="text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                    {t('admin.addons.type.integration')} — {t('admin.addons.integrationHint')}
-                  </span>
-                </div>
-                {integrationAddons.map(addon => (
-                  <AddonRow key={addon.id} addon={addon} onToggle={handleToggle} t={t} />
-                ))}
-              </div>
-            )}
-          </div>
+  const subtitle = (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      {t('admin.addons.subtitleBefore')}
+      <img src={dark ? '/text-light.svg' : '/text-dark.svg'} alt="TREK" style={{ height: 10, verticalAlign: 'middle', opacity: 0.7 }} />
+      {t('admin.addons.subtitleAfter')}
+    </span>
+  )
+
+  /** Whether an addon is shown under the search and the filter. */
+  const shown = (addon: Addon) => {
+    if (view === 'on' && !addon.enabled) return false
+    if (view === 'off' && addon.enabled) return false
+    const q = query.trim().toLocaleLowerCase()
+    if (!q) return true
+    const label = getAddonLabel(t, addon)
+    return `${label.name} ${label.description ?? ''}`.toLocaleLowerCase().includes(q)
+  }
+
+  const card = (g: (typeof groups)[number]) => {
+    const meta = TYPE_META[g.key]
+    const all = g.key === 'integration' ? [...aiAddons, ...g.addons] : g.addons
+    const visible = g.addons.filter(shown)
+    const ai = g.key === 'integration' && aiAddons.some(shown)
+    if (!visible.length && !ai) return null
+    const on = all.filter(a => a.enabled).length
+    return (
+      <SettingsCard
+        key={g.key}
+        icon={meta.icon}
+        title={t(meta.labelKey)}
+        hint={t(meta.hintKey)}
+        badge={(
+          <Tooltip label={t('admin.addons.group.count', { enabled: on, total: all.length })}>
+            <span className="inline-flex"><StatusPill tone={on > 0 ? 'success' : 'neutral'}>{on}/{all.length}</StatusPill></span>
+          </Tooltip>
         )}
-      </div>
-    </div>
+        bodyClassName="p-3"
+      >
+        <div className="divide-y divide-edge-faint overflow-hidden rounded-[12px] border border-edge-faint bg-surface-card">
+          {/* The AI addons share a connection and a settings dialog, so they head the card as one tile. */}
+          {ai && <AiAddonTile addons={aiAddons} onToggle={handleToggle} />}
+          {visible.map(tile)}
+        </div>
+      </SettingsCard>
+    )
+  }
+
+  const [first, ...rest] = groups
+  const cards = { start: first ? card(first) : null, end: rest.map(card).filter(Boolean) }
+
+  return (
+    <>
+      <SettingsCard
+        icon={Puzzle}
+        title={t('admin.addons.title')}
+        hint={subtitle}
+        badge={totalCount > 0 ? (
+          <Tooltip label={t('admin.addons.group.count', { enabled: enabledCount, total: totalCount })}>
+            <span className="inline-flex">
+              <StatusPill tone={enabledCount > 0 ? 'success' : 'neutral'}>{enabledCount}/{totalCount}</StatusPill>
+            </span>
+          </Tooltip>
+        ) : undefined}
+      >
+        {addons.length === 0
+          ? <EmptyState scene="idle" title={t('admin.addons.noAddons')} surface="var(--bg-secondary)" />
+          : <AddonToolbar groups={groups.map(g => ({ key: g.key, addons: g.key === 'integration' ? [...aiAddons, ...g.addons] : g.addons }))} query={query} onQuery={setQuery} view={view} onView={setView} t={t} />}
+      </SettingsCard>
+
+      {addons.length > 0 && (cards.start || cards.end.length > 0 ? (
+        <div className="grid grid-cols-1 gap-x-5 xl:grid-cols-2 xl:items-start">
+          <div className="min-w-0">{cards.start}</div>
+          <div className="min-w-0">{cards.end}</div>
+        </div>
+      ) : (
+        <p className="m-0 rounded-2xl border border-dashed border-edge-faint px-4 py-8 text-center text-content-muted" style={fs(13, 'body')}>
+          {t('admin.addons.noMatch')}
+        </p>
+      ))}
+    </>
   )
 }
 
-interface AddonRowProps {
-  addon: Addon
-  onToggle: (addon: Addon) => void
-  t: (key: string) => string
-  statusOverride?: boolean
-  hideToggle?: boolean
-}
+type AddonView = 'all' | 'on' | 'off'
 
-function getAddonLabel(t: (key: string) => string, addon: Addon): { name: string; description: string } {
-  const nameKey = `admin.addons.catalog.${addon.id}.name`
-  const descKey = `admin.addons.catalog.${addon.id}.description`
-  const translatedName = t(nameKey)
-  const translatedDescription = t(descKey)
-
-  return {
-    name: translatedName !== nameKey ? translatedName : addon.name,
-    description: translatedDescription !== descKey ? translatedDescription : addon.description,
-  }
-}
-
-function AddonRow({ addon, onToggle, t, nameOverride, descriptionOverride, statusOverride, hideToggle }: AddonRowProps & { nameOverride?: string; descriptionOverride?: string }) {
-  const isComingSoon = false
-  const label = getAddonLabel(t, addon)
-  const displayName = nameOverride || label.name
-  const displayDescription = descriptionOverride || label.description
-  const enabledState = statusOverride ?? addon.enabled
+/**
+ * The head card's body: a tile per type with how many of it are on, then a
+ * search over the addons' names and descriptions and a switch between all,
+ * the ones on and the ones off.
+ */
+function AddonToolbar({ groups, query, onQuery, view, onView, t }: {
+  groups: { key: string; addons: Addon[] }[]
+  query: string
+  onQuery: (q: string) => void
+  view: AddonView
+  onView: (v: AddonView) => void
+  t: (key: string, params?: Record<string, unknown>) => string
+}) {
   return (
-    <div className="flex items-center gap-4 px-6 py-4 border-b transition-colors hover:opacity-95" style={{ borderColor: 'var(--border-secondary)', opacity: isComingSoon ? 0.5 : 1, pointerEvents: isComingSoon ? 'none' : 'auto' }}>
-      {/* Icon */}
-      <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>
-        <AddonIcon name={addon.icon} size={20} />
+    <>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        {groups.map(g => {
+          const meta = TYPE_META[g.key]
+          const Icon = meta.icon
+          const on = g.addons.filter(a => a.enabled).length
+          return (
+            <div key={g.key} className="flex items-center gap-3 rounded-[12px] border border-edge-faint bg-surface-card px-3 py-2.5">
+              <span className="grid h-8 w-8 flex-none place-items-center rounded-[10px] bg-surface-secondary text-content-secondary">
+                <Icon size={15} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-semibold text-content" style={fs(12.5, 'body')}>{t(meta.labelKey)}</span>
+                <span className="block text-content-faint" style={fs(11)}>{t('admin.addons.group.count', { enabled: on, total: g.addons.length })}</span>
+              </span>
+              <span className={`font-geist font-bold tabular-nums ${on > 0 ? 'text-content' : 'text-content-faint'}`} style={fs(18, 'body')} aria-hidden>{on}</span>
+            </div>
+          )
+        })}
       </div>
-
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>{displayName}</span>
-          {isComingSoon && (
-            <span className="text-[9px] font-semibold px-2 py-0.5 rounded-full" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-faint)' }}>
-              Coming Soon
-            </span>
-          )}
-          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full" style={{ background: 'var(--bg-secondary)', color: 'var(--text-muted)' }}>
-            {addon.type === 'global' ? t('admin.addons.type.global') : addon.type === 'integration' ? t('admin.addons.type.integration') : t('admin.addons.type.trip')}
-          </span>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <label className="relative flex min-w-0 flex-1 items-center">
+          <Search size={14} className="pointer-events-none absolute start-3 text-content-faint" />
+          <input
+            type="search"
+            value={query}
+            onChange={e => onQuery(e.target.value)}
+            placeholder={t('admin.addons.search')}
+            aria-label={t('admin.addons.search')}
+            className="h-9 w-full rounded-[10px] border border-edge-faint bg-surface-card ps-8 pe-3 text-content outline-none transition-colors placeholder:text-content-faint focus:border-accent"
+            style={fs(13, 'body')}
+          />
+        </label>
+        <div className="inline-flex flex-none gap-1 rounded-[10px] bg-surface-tertiary p-1" role="group" aria-label={t('admin.addons.filter')}>
+          {(['all', 'on', 'off'] as const).map(v => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => onView(v)}
+              aria-pressed={view === v}
+              className={`h-7 rounded-[8px] px-3 font-medium transition-colors ${view === v ? 'bg-surface-card text-content shadow-sm' : 'text-content-muted hover:text-content'}`}
+              style={fs(12.5, 'body')}
+            >
+              {t(`admin.addons.filter.${v}`)}
+            </button>
+          ))}
         </div>
-        <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{displayDescription}</p>
       </div>
-
-      {/* Toggle */}
-      <div className="flex items-center gap-2 shrink-0">
-        <span className="hidden sm:inline text-xs font-medium" style={{ color: (enabledState && !isComingSoon) ? 'var(--text-primary)' : 'var(--text-faint)' }}>
-          {isComingSoon ? t('admin.addons.disabled') : enabledState ? t('admin.addons.enabled') : t('admin.addons.disabled')}
-        </span>
-        {!hideToggle && (
-          <button
-            onClick={() => !isComingSoon && onToggle(addon)}
-            disabled={isComingSoon}
-            className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
-            style={{ background: (enabledState && !isComingSoon) ? 'var(--text-primary)' : 'var(--border-primary)', cursor: isComingSoon ? 'not-allowed' : 'pointer' }}
-          >
-            <span
-              className="inline-block h-4 w-4 transform rounded-full transition-transform"
-              style={{
-                background: 'var(--bg-card)',
-                transform: (enabledState && !isComingSoon) ? 'translateX(22px)' : 'translateX(4px)',
-              }}
-            />
-          </button>
-        )}
-      </div>
-    </div>
+    </>
   )
 }

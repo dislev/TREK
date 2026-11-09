@@ -1,23 +1,12 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from 'react'
+import React, { useMemo } from 'react'
 import { CheckCircle, XCircle, AlertCircle, Info, X } from 'lucide-react'
-
-type ToastType = 'success' | 'error' | 'warning' | 'info'
-
-interface Toast {
-  id: number
-  message: string
-  type: ToastType
-  duration: number
-  removing: boolean
-}
+import { useToastQueue, type ToastType } from './useToastQueue'
 
 declare global {
   interface Window {
     __addToast?: (message: string, type?: ToastType, duration?: number) => number
   }
 }
-
-let toastIdCounter = 0
 
 const ICON_COLORS: Record<ToastType, string> = {
   success: '#22c55e',
@@ -27,35 +16,7 @@ const ICON_COLORS: Record<ToastType, string> = {
 }
 
 export function ToastContainer() {
-  const [toasts, setToasts] = useState<Toast[]>([])
-
-  const addToast = useCallback((message: string, type: ToastType = 'info', duration: number = 3000) => {
-    const id = ++toastIdCounter
-    setToasts(prev => [...prev, { id, message, type, duration, removing: false }])
-
-    if (duration > 0) {
-      setTimeout(() => {
-        setToasts(prev => prev.map(t => t.id === id ? { ...t, removing: true } : t))
-        setTimeout(() => {
-          setToasts(prev => prev.filter(t => t.id !== id))
-        }, 400)
-      }, duration)
-    }
-
-    return id
-  }, [])
-
-  const removeToast = useCallback((id: number) => {
-    setToasts(prev => prev.map(t => t.id === id ? { ...t, removing: true } : t))
-    setTimeout(() => {
-      setToasts(prev => prev.filter(t => t.id !== id))
-    }, 400)
-  }, [])
-
-  useEffect(() => {
-    window.__addToast = addToast
-    return () => { delete window.__addToast }
-  }, [addToast])
+  const { toasts, dismissToast: removeToast } = useToastQueue({ exitMs: 400, restorePrevious: false })
 
   const icons: Record<ToastType, React.ReactNode> = {
     success: <CheckCircle size={18} style={{ color: ICON_COLORS.success, flexShrink: 0 }} />,
@@ -92,7 +53,9 @@ export function ToastContainer() {
       `}</style>
       <div style={{
         position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
-        zIndex: 9999, display: 'flex', flexDirection: 'column-reverse', gap: 8,
+        // Above modal overlays (which sit around z-index 10000 with a backdrop-filter
+        // blur) so error toasts paint on top and stay legible instead of blurred behind.
+        zIndex: 100000, display: 'flex', flexDirection: 'column-reverse', gap: 8,
         pointerEvents: 'none', maxWidth: 420, width: '100%', padding: '0 16px',
       }}>
         {toasts.map(toast => (
@@ -111,13 +74,13 @@ export function ToastContainer() {
           >
             {icons[toast.type] || icons.info}
             <span style={{
-              flex: 1, fontSize: 13, fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)',
+              flex: 1, fontSize: 'calc(13px * var(--fs-scale-body, 1))', fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)',
               lineHeight: 1.4,
-              fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif",
+              fontFamily: "var(--font-system)",
             }}>
               {toast.message}
             </span>
-            <button
+            <button type="button"
               onClick={() => removeToast(toast.id)}
               className="nomad-toast-close"
               style={{
@@ -138,19 +101,21 @@ export function ToastContainer() {
   )
 }
 
-export const useToast = () => {
-  const show = useCallback((message: string, type: ToastType, duration?: number) => {
-    if (window.__addToast) {
-      window.__addToast(message, type, duration)
+// One object for the life of the component: hooks list `toast` in their effect
+// dependencies, and a fresh object per render re-ran those effects on every keystroke.
+export const useToast = () =>
+  useMemo(() => {
+    const show = (message: string, type: ToastType, duration?: number) => {
+      if (window.__addToast) {
+        window.__addToast(message, type, duration)
+      }
+    }
+    return {
+      success: (message: string, duration?: number) => show(message, 'success', duration),
+      error: (message: string, duration?: number) => show(message, 'error', duration),
+      warning: (message: string, duration?: number) => show(message, 'warning', duration),
+      info: (message: string, duration?: number) => show(message, 'info', duration),
     }
   }, [])
-
-  return {
-    success: (message: string, duration?: number) => show(message, 'success', duration),
-    error: (message: string, duration?: number) => show(message, 'error', duration),
-    warning: (message: string, duration?: number) => show(message, 'warning', duration),
-    info: (message: string, duration?: number) => show(message, 'info', duration),
-  }
-}
 
 export default useToast

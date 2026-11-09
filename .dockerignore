@@ -1,7 +1,9 @@
 node_modules
 client/node_modules
 server/node_modules
+shared/node_modules
 client/dist
+shared/dist
 data
 uploads
 .git
@@ -14,6 +16,8 @@ uploads
 chart/
 docs/
 docker-compose.yml
+docker-compose.minio-test.yml
+minio-licence.key
 unraid-template.xml
 *.sqlite
 *.sqlite-shm
@@ -29,4 +33,7 @@ Thumbs.db
 sonar-project.properties
 server/tests/
 server/vitest.config.ts
-server/reset-admin.js
+**/*.test.ts
+**/*.spec.ts
+scripts/
+charts/
