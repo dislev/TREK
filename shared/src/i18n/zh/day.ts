@@ -23,6 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': '确认号',
   'day.editAccommodation': '编辑住宿',
   'day.reservations': '预订',
-  'day.dailyNote': '每日备注',
+  'day.summary': '当日摘要',
 };
 export default day;

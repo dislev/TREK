@@ -23,6 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Kinnitus',
   'day.editAccommodation': 'Muuda majutust',
   'day.reservations': 'Broneeringud',
-  'day.dailyNote': 'Päeva märkus',
+  'day.summary': 'Päeva kokkuvõte',
 };
 export default day;

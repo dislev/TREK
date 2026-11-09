@@ -24,7 +24,7 @@ const day: TranslationStrings = {
   'day.confirmation': 'Təsdiq',
   'day.editAccommodation': 'Yaşayış yerini redaktə et',
   'day.reservations': 'Rezervasiyalar',
-  'day.dailyNote': 'Gündəlik qeyd',
+  'day.summary': 'Günün xülasəsi',
 };
 
 export default day;

@@ -24,6 +24,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Επιβεβαίωση',
   'day.editAccommodation': 'Επεξεργασία διαμονής',
   'day.reservations': 'Κρατήσεις',
-  'day.dailyNote': 'Σημείωση ημέρας',
+  'day.summary': 'Περίληψη ημέρας',
 };
 export default day;

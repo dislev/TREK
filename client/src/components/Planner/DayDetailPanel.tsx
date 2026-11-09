@@ -395,8 +395,8 @@ function DayWeather({ weather, loading, isFahrenheit, placeName }: { weather: We
 }
 
 /**
- * The day's own note, kept apart from the note entries that sit in the day's
- * timeline: an entry is a short, titled card, the daily note is the longer
+ * The day's summary, kept apart from the note entries that sit in the day's
+ * timeline: an entry is a short, titled card, the summary is the longer
  * write-up for the whole day (the `days.notes` column). Shown as Markdown,
  * edited in place (keyed by day, so a draft never follows the panel to another day); the section stays out of the way when there is nothing to
  * show and the viewer cannot edit.
@@ -427,12 +427,12 @@ function DailyNote({ day, tripId, canEdit }: { day: Day; tripId: number; canEdit
   }
 
   return (
-    <DialogSection label={t('day.dailyNote')}>
+    <DialogSection label={t('day.summary')}>
       {editing ? (
         <div className="flex flex-col gap-2">
           <NoteFormatToolbar textareaRef={areaRef} onChange={setDraft} compact />
           <textarea ref={areaRef} value={draft} rows={6} autoFocus
-            aria-label={t('day.dailyNote')}
+            aria-label={t('day.summary')}
             onChange={e => setDraft(e.target.value)}
             placeholder={t('notes.bodyPlaceholder')}
             className={`${TEXTAREA} resize-y`} />
@@ -460,7 +460,7 @@ function DailyNote({ day, tripId, canEdit }: { day: Day; tripId: number; canEdit
           )}
         </div>
       ) : (
-        <AddRowButton onClick={start}>{t('day.dailyNote')}</AddRowButton>
+        <AddRowButton onClick={start}>{t('day.summary')}</AddRowButton>
       )}
     </DialogSection>
   )

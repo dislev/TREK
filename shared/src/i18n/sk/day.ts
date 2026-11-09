@@ -23,6 +23,6 @@ const day: TranslationStrings = {
   'day.confirmation': 'Potvrdenie',
   'day.editAccommodation': 'Upraviť ubytovanie',
   'day.reservations': 'Rezervácie',
-  'day.dailyNote': 'Poznámka dňa',
+  'day.summary': 'Zhrnutie dňa',
 };
 export default day;

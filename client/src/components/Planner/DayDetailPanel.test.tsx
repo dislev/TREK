@@ -2277,15 +2277,15 @@ describe('DayDetailPanel opening a booking', () => {
   });
 });
 
-describe('DayDetailPanel daily note', () => {
-  it('FE-PLANNER-DAYDETAIL-102: shows the day\'s notes as the daily note, as Markdown', () => {
+describe('DayDetailPanel day summary', () => {
+  it('FE-PLANNER-DAYDETAIL-102: shows the day\'s notes as the day summary, as Markdown', () => {
     const noted = buildDay({ id: 1, trip_id: 1, date: '2025-06-15', title: 'Day in Paris', notes: 'Pack **snacks**' });
     render(<DayDetailPanel {...defaultProps} day={noted} days={[noted]} />);
-    expect(screen.getByText('Daily note')).toBeInTheDocument();
+    expect(screen.getByText('Day summary')).toBeInTheDocument();
     expect(screen.getByText('snacks').tagName).toBe('STRONG');
   });
 
-  it('FE-PLANNER-DAYDETAIL-103: a member who can edit adds a daily note and it is saved to the day', async () => {
+  it('FE-PLANNER-DAYDETAIL-103: a member who can edit adds a day summary and it is saved to the day', async () => {
     const user = userEvent.setup();
     const bodies: unknown[] = [];
     server.use(http.put('/api/trips/1/days/1', async ({ request }) => {
@@ -2293,16 +2293,16 @@ describe('DayDetailPanel daily note', () => {
       return HttpResponse.json({ day: { ...day, notes: 'Easy evening' } });
     }));
     render(<DayDetailPanel {...defaultProps} />);
-    await user.click(screen.getByRole('button', { name: 'Daily note' }));
-    await user.type(screen.getByRole('textbox', { name: 'Daily note' }), 'Easy evening');
+    await user.click(screen.getByRole('button', { name: 'Day summary' }));
+    await user.type(screen.getByRole('textbox', { name: 'Day summary' }), 'Easy evening');
     await user.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(bodies).toEqual([{ notes: 'Easy evening' }]));
   });
 
-  it('FE-PLANNER-DAYDETAIL-104: without edit permission and without a note, no daily note section', () => {
+  it('FE-PLANNER-DAYDETAIL-104: without edit permission and without a note, no day summary section', () => {
     seedStore(useAuthStore, { user: buildUser({ id: 999, role: 'user' }), isAuthenticated: true });
     seedStore(usePermissionsStore, { permissions: { day_edit: 'admin' } });
     render(<DayDetailPanel {...defaultProps} />);
-    expect(screen.queryByText('Daily note')).not.toBeInTheDocument();
+    expect(screen.queryByText('Day summary')).not.toBeInTheDocument();
   });
 });
